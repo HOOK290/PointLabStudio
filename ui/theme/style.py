@@ -11,6 +11,7 @@ from string import Template
 from ui.theme.tokens import FONTS, RADII, get_theme
 
 _CHECK_ICON = (Path(__file__).resolve().parents[2] / "resources" / "check.svg").as_posix()
+_CHEVRON_ICON = (Path(__file__).resolve().parents[2] / "resources" / "chevron-down.svg").as_posix()
 
 _QSS = Template("""
 * {
@@ -104,10 +105,9 @@ QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus {
 }
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox::down-arrow {
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid ${text2};
+    image: url(${chevron_icon});
+    width: 12px;
+    height: 8px;
     margin-right: 6px;
 }
 QComboBox QAbstractItemView {
@@ -376,7 +376,7 @@ QWidget#inspector { background: ${panel}; border: 1px solid ${border}; border-ra
 QScrollArea#overviewScroll { background: transparent; border: none; }
 QScrollArea#overviewScroll > QWidget > QWidget { background: transparent; }
 QWidget#sectionCard { background: ${panel2}; border-radius: 10px; }
-QWidget#overviewCard { background: ${panel2}; border-radius: 12px; }
+QWidget#overviewCard { background: ${panel2}; border: 1px solid ${border}; border-radius: 12px; }
 QLabel#cardHead {
     font-size: 11px;
     font-weight: 600;
@@ -394,7 +394,7 @@ QLabel#bigNumber {
     color: ${text};
     letter-spacing: -0.5px;
 }
-QLabel#rowCaption { font-size: 11px; color: ${text3}; }
+QLabel#rowCaption { font-size: 11px; color: ${text2}; }
 QLabel#valueText { font-size: 13px; color: ${text}; }
 QLabel#badgePill {
     background: ${panel3};
@@ -449,7 +449,7 @@ QPlainTextEdit#logDrawer {
 
 def build_stylesheet(theme_name: str = "dark") -> str:
     t = get_theme(theme_name)
-    return _QSS.substitute(
+    stylesheet = _QSS.substitute(
         ui_font=FONTS["ui"],
         mono_font=FONTS["mono"],
         control=RADII["control"],
@@ -457,5 +457,36 @@ def build_stylesheet(theme_name: str = "dark") -> str:
         card=RADII["card"],
         dialog=RADII["dialog"],
         check_icon=_CHECK_ICON,
+        chevron_icon=(_CHEVRON_ICON.replace("chevron-down.svg", "chevron-down-light.svg")
+                      if theme_name == "light" else _CHEVRON_ICON),
         **t,
     )
+    if theme_name == "light":
+        stylesheet += Template("""
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+    background: ${panel};
+    selection-background-color: ${accent};
+    selection-color: ${accent_text};
+    placeholder-text-color: ${text3};
+}
+QComboBox#headerCombo { background: ${panel}; }
+QPlainTextEdit, QTextEdit {
+    color: ${text};
+    selection-background-color: ${accent};
+    selection-color: ${accent_text};
+}
+QToolButton#headerBtn:disabled, QPushButton:disabled,
+QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
+    color: ${disabled};
+}
+QToolButton#headerBtn:checked { color: ${accent}; }
+QLabel#warning { color: ${danger}; }
+QCheckBox::indicator:checked { image: url(${check_icon}); }
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal { background: #959DA9; }
+QLabel#overlayPill {
+    background: ${panel};
+    color: ${text};
+    border: 1px solid ${border_strong};
+}
+""").substitute(check_icon=_CHECK_ICON, **t)
+    return stylesheet

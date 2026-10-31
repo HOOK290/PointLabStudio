@@ -37,6 +37,9 @@ class ParamDialog(QDialog):
                 widget = QComboBox()
                 for label, data in field.get("options", []):
                     widget.addItem(str(label), data)
+                index = widget.findData(field.get("default"))
+                if index >= 0:
+                    widget.setCurrentIndex(index)
             elif kind == "int":
                 widget = QSpinBox()
                 widget.setRange(int(field.get("min", -10**9)), int(field.get("max", 10**9)))

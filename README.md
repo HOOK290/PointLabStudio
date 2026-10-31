@@ -1,102 +1,100 @@
-# PointLabStudio — 点云综合处理平台
+# PointLab Studio v1.1.0
 
-**v1.0.0** ｜ 桌面点云工作站，PySide6 + pygfx/wgpu + open3d，Windows 应用。
+基于 PySide6、pygfx/wgpu 和 Open3D 的 Windows 点云工作站，支持点云浏览、裁剪、测量、滤波、配准、网格重建与工程保存。提供深色和浅色主题。
 
-打开点云 → 查看/测量 → 处理/配准 → 导出，一个窗口完成。
+## 直接运行 EXE
 
-## 功能
+从 GitHub Releases 下载 `PointLabStudio-v1.1.0-Windows-x64.exe`，双击运行，无需安装 Python。可直接将这个 EXE 发给其他人。
 
-- **自动分级加载**：<100 万点直接载入；中大点云先预览、后台载入全量后替换；>1 亿点八叉树流式（1 亿点约 42 秒得到 80 万采样点，保留强度），可取消。
-- **GPU 渲染**：按视距三档 LOD，脏标记按需重绘。
-- **格式**：PLY / PCD / XYZ / XYZN / XYZRGB / PTS / LAS 读写；BIN / NPY / NPZ / TXT / CSV 读取；LAZ / E57 需装 `laspy`、`lazrs`、`pye57`。
-- **字段保真**：强度、标签、法线等标量场全保留，导出不烘焙显示伪彩。
-- **颜色**：默认 / 高度 / 强度 / 标量场 / RGB / 标签 / 单色，7 种色带，直方图，手动或自动值域。
-- **处理命令**：体素降采样、随机采样、SOR、ROR、盒式裁切，可撤销/重做。
-- **分割配准**：平面分割、地面提取、DBSCAN、点到点/点到面 ICP、FPFH+RANSAC、4×4 矩阵编辑。
-- **几何**：法线估计、C2C、C2M、Poisson 网格重建。
-- **测量选择**：折线长度与面积（导出 CSV）；点选/框选，可提取或删除选中点。
-- **命令内核**：处理链、脚本控制台、CLI 共用同一套命令注册表。
-- **工程文件** `.pls`：保存点云引用、相机、裁剪范围与派生数据。
-- **插件**：`register(api)` 注册命令，界面与 CLI 自动出现。
-- **界面**：深/浅主题、卡片式场景列表、颜色条与概览面板、可收起日志、窗口状态记忆。
+支持 Windows 10/11 64 位，需要支持 Vulkan 或 DirectX 12 的显卡及驱动。单文件启动时会自动选择可写目录并解压内置运行库，请稍候；正常退出后清理临时运行文件。EXE 已包含 LAZ/E57 读取依赖。
 
-## 环境要求
+## 从 Git 安装
 
-| 项 | 要求 |
-| --- | --- |
-| 操作系统 | Windows 10 / 11 64 位 |
-| Python | 3.11+（实测 3.12.10） |
-| 显卡 | 支持 Vulkan 或 DirectX 12，驱动较新 |
-| 磁盘 | 依赖约 1.3 GB |
+环境要求：Windows 10/11 64 位、Git、Python 3.12 64 位，以及支持 Vulkan 或 DirectX 12 的显卡和驱动。
 
-## 安装
+在 PowerShell 中执行：
 
 ```powershell
 git clone https://github.com/jarviscccwl/PointLabStudio.git
 cd PointLabStudio
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -U pip
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install --upgrade pip
 .venv\Scripts\python.exe -m pip install -r requirements.txt
+.\start.bat
 ```
 
-LAZ / E57 可选依赖：`.venv\Scripts\python.exe -m pip install laspy lazrs pye57`。
-
-## 启动
+之后双击 `start.bat` 即可启动，无需手动激活虚拟环境。也可直接打开文件或目录：
 
 ```powershell
-.\start.bat                                          # 双击亦可
-.venv\Scripts\python.exe run.py                      # 命令行等价
-.venv\Scripts\python.exe run.py "D:\data\points"     # 直接打开文件/目录
+.venv\Scripts\python.exe run.py "D:\点云目录"
 ```
 
-运行时目录：`.tmp/pygfx/`（着色器缓存）、`%APPDATA%\PointLabStudio\`（设置与日志）。
+更新项目时，在项目目录执行 `git pull`，再运行上述依赖安装命令。获取固定版本可在克隆后执行 `git checkout v1.1.0`。
 
-## 基本操作
+## 使用
 
-| 操作 | 方式 | 操作 | 方式 |
+- **逐帧浏览**：拖入文件夹后按文件名自然排序，默认显示第一帧。点击列表、按方向键或中央上方 ‹ / › 切换，上一帧自动隐藏。文件按需后台加载，并预取相邻帧。
+- **叠加显示**：手动勾选其他点云后，切帧时仍保留显示；取消勾选即可隐藏。要保留当前帧，可右键「固定叠加显示」。双击聚焦，右键可移除或重新加载。
+- **双窗格**：点击中央上方「双窗格」，左侧当前帧、右侧上一帧或下一帧。默认视角联动，可取消后分别旋转、平移和缩放。处理、选点与裁剪作用于左侧，右侧用于参考。
+- **视角**：自由视角下，左键旋转、右键/中键平移、滚轮缩放、双击设置旋转中心。固定视角锁定当前 Z 高度，拖动水平转向，滚轮沿当前朝向在 XY 平面平滑移动。
+- **裁剪**：点击裁剪按钮，选择「按包围盒」，关闭面板后拖动橙色手柄。松开更新点数与范围，Esc 取消拖动。正对视线的轴需先旋转视图。
+- **保存框内点**：「工程 → 导出裁剪内点云」。裁剪只改变显示；「导出当前点云」仍导出完整数据。要生成可继续处理的新点云，使用「处理 → 盒裁切」，默认沿用当前裁剪框。
+- **测量与选择**：测量工具连续加点；选点查看属性；框选后在「处理」中提取或删除。测量可导出 CSV，Esc 退出工具。
+- **处理**：当前帧加载完成后使用「处理」菜单。自动显示新结果、隐藏未固定的原数据，支持撤销/重做。配准或距离分析所选的参考帧若未加载，会先后台读取。底部可取消任务；部分原生算法需等待当前计算阶段结束。
+- **网格**：Poisson 重建后，在「工程 → 网格结果」中显示/隐藏、移除或导出 PLY。网格随工程保存。
+- **工程**：保存 `.pls` 和同名 `.assets` 文件夹；移动工程时二者一起移动，并保留源点云。打开工程会将数据加入当前场景。
+
+| 快捷键 | 操作 | 快捷键 | 操作 |
 | --- | --- | --- | --- |
-| 旋转 | 左键拖拽（Shift 精调） | 平移 | 右键/中键拖拽 |
-| 缩放 | 滚轮 | 旋转中心 | 双击点云位置 |
-| 切换点云 | ← ↑ / → ↓ | 显示/隐藏 | Space |
-| 重置视角 | R | 颜色模式 | C |
-| 点大小 | + / - | 裁剪范围 | B |
-| 导出 | Ctrl+E | 撤销/重做 | Ctrl+Z / Ctrl+Y |
-| 退出工具 | Esc | 帮助 | H |
+| Ctrl+O | 打开文件 | Ctrl+S | 保存工程 |
+| Ctrl+E | 导出当前点云 | Ctrl+Z / Ctrl+Y | 撤销 / 重做 |
+| R | 重置视角 | B | 开关裁剪 |
+| C | 循环颜色 | + / − | 点大小 |
+| ← / ↑ | 上一帧 | → / ↓ | 下一帧 |
+| Space | 显示/隐藏选中点云 | H | 完整快捷键 |
 
-打开：拖入窗口或 文件菜单。保存：`文件 → 保存工程`（`.pls`）。
+## 格式与限制
 
-## 支持格式
+- 读取：BIN、PLY、PCD、XYZ/XYZN/XYZRGB、PTS、LAS、NPY/NPZ、TXT/CSV。
+- 导出：PLY、PCD、LAS、PTS、XYZ；字段保真优先选 PLY/PCD。
+- LAZ/E57 读取需额外安装：`.venv\Scripts\python.exe -m pip install laspy lazrs pye57`。
+- 大文件可能先显示采样预览；预览上执行的处理和导出仅包含已加载点，界面会标注。
+- 最近源帧缓存以 8 帧、512 MB 为回收预算；当前帧、相邻帧和手动叠加项优先保留，派生结果不自动回收。状态栏点数表示已加载的数据。
+- 坐标按米显示，不自动识别或转换原始数据单位。颜色条与直方图基于原始点云。
+- 体素降采样保留颜色/强度均值，其他属性不参与聚合；随机采样保留逐点属性。DBSCAN 超过 15 万点时抽样聚类，再用最近邻传播标签。
+- LAS 导出采用 1.2 格式、毫米精度，分类值限 0–31；更丰富的标签使用 PLY/PCD。LAZ/E57 当前只支持读取。
 
-| 格式 | 读 | 写 | 说明 |
-| --- | --- | --- | --- |
-| PLY | ✅ | ✅ | 保留全部标量字段 |
-| PCD | ✅ | ✅ | binary / ascii |
-| XYZ / XYZN / XYZRGB | ✅ | ✅ | 字段名自动识别 |
-| PTS | ✅ | ✅ | 支持强度 |
-| LAS | ✅ | ✅ | 1.2，点格式 0/1/2/3/6/7/8 |
-| LAZ / E57 | ✅ | — | 需可选依赖 |
-| NPY / NPZ / TXT / CSV | ✅ | — | 数值矩阵 |
-| BIN | ✅ | — | 维度自动识别 |
+## 目录与常见问题
 
-## 命令行
+`apps/` 应用入口 · `core/` 数据与算法 · `ui/` 界面 · `resources/` 图标 · `packaging/` EXE 构建配置。`.venv/` 和 `dist/` 不上传 Git 仓库，EXE 作为 GitHub Release 附件发布。
+
+设置、日志和渲染缓存默认位于 `%APPDATA%\PointLabStudio\`；可用 `POINTLAB_HOME` 指定其他位置。EXE 遇到用户数据目录不可写时，会自动回退到 EXE 旁的 `.PointLabStudio/`，保留该文件夹即可保留设置。
+操作失败请展开底部「日志」；启动失败查看该目录下的 `logs/pointlab.log`。若提示缺少依赖，重新执行安装命令；若渲染不可用，检查显卡驱动。
+
+EXE 会自动避开不可写的 `%TEMP%` / `%TMP%`。如果所有候选目录均不可写，请将 EXE 移到自己有写入权限的文件夹后再打开，无需修改系统权限。
+
+命令行：`.venv\Scripts\python.exe -m apps.cli --help`。
+
+## 构建 EXE
+
+在 Windows 64 位、Python 3.12 环境中执行：
 
 ```powershell
-.venv\Scripts\python.exe -m apps.cli data\scene.bin --info
-.venv\Scripts\python.exe -m apps.cli data\scene.bin --stage voxel:0.2 --stage sor:20,2.0 --export out.ply
-.venv\Scripts\python.exe -m apps.cli data\scene.bin --commands steps.json --export out.las
-.venv\Scripts\python.exe -m apps.cli --list-commands
+.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+powershell -ExecutionPolicy Bypass -File packaging/build.ps1
 ```
 
-步骤：`voxel:体素`、`random:点数`、`sor:k,std`、`ror:半径,邻居数`、`crop:x0,x1,y0,y1,z0,z1`、`plane:距离`、`ground:距离`、`dbscan:半径,点数`。
-其他参数：`--outdir`、`--max-points`、`--bin-dim`、`--dtype`、`--npy-key`。
+生成 `dist/PointLabStudio-v1.1.0-Windows-x64.exe`。构建脚本先用 PyInstaller 打包应用，再用 Windows 自带的 .NET Framework 编译目录回退启动器；不需要另外分发源码或依赖目录。不要直接分发 `build/` 中的中间产物。
 
-## 常见问题
+## 更新记录
 
-| 现象 | 处理 |
-| --- | --- |
-| `start.bat` 提示找不到 `.venv` | 按「安装」建 `.venv`，须在仓库根目录 |
-| 启动闪退/白屏 | 看 `%APPDATA%\PointLabStudio\logs\pointlab.log`；多为驱动过旧或 Python <3.11 |
-| pygfx 字体缓存报错 | 用 `run.py` 启动，会设 `PYGFX_DATA_DIR` |
-| 打不开 LAZ / E57 | 装 `laspy lazrs pye57` |
-| 缺少示例数据 | `tools\make_test_data.py --out data`，打开 `data/scene_small.bin` |
-| 大文件只显示采样点 | >5000 万点为采样预览，界面标注比例 |
+### v1.1.0 · 2026-10-31
+
+- 新增按需逐帧加载、自动切换显示、相邻帧双窗格对比与视角联动。
+- 提升浅色主题的文字、控件、直方图、无着色点云与工具线条对比度。
+- 新增固定高度平滑行走、可拖动裁剪框及裁剪内点云导出。
+- 完善网格管理、工程恢复、跨盘保存、任务取消与安全关闭。
+- 优化侧栏排版，精简项目目录，文档统一到 README。
+- 修复粗配准衔接 ICP、抽样法线对应、任务取消及预览状态保存；降低法线与聚类的峰值内存。
+- 修复 LAS 范围/分类信息与 E57 多扫描位姿、颜色读取；提供 Windows 单文件 EXE。
+- 修复系统临时目录不可写时 EXE 无法启动的问题，自动选择可写目录并在退出后清理。

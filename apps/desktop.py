@@ -36,12 +36,17 @@ def main(argv=None):
     theme = args.background or settings.theme
 
     from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QIcon
+    from pathlib import Path
 
     from ui.main_window import MainWindow
     from ui.theme import build_stylesheet
 
     app = QApplication(sys.argv[:1] if argv is not None else sys.argv)
     app.setApplicationName("PointLabStudio")
+    from core import __version__
+    app.setApplicationVersion(__version__)
+    app.setWindowIcon(QIcon(str(Path(__file__).resolve().parents[1] / "resources" / "app.svg")))
     app.setOrganizationName("PointLabStudio")
     app.setStyle("Fusion")
     app.setStyleSheet(build_stylesheet(theme))

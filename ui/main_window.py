@@ -7,10 +7,8 @@
   └─ 右侧「数据概览」（点数/空间范围/属性/场景统计/来源）
   底部状态栏（点数/任务进度/内存/FPS + 日志开关），日志为可收起抽屉
 
-Auto-Ingest 流程（docs/产品方案.md §3.2）：
-  S 级：同步全量读取，直接展示
-  M 级：先展示预览 → 后台线程全量加载 → 无缝替换
-  L 级：先展示预览 → 后台全量加载（超内存阈值则保持高质量采样并提示）
+加载流程：文件夹后台扫描；当前帧优先、相邻帧预取，最近帧按内存预算缓存。
+单帧读取始终在后台执行，大文件先预览，超过内存阈值时使用采样。
 """
 
 from __future__ import annotations
@@ -18,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from weakref import WeakKeyDictionary
 
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
@@ -40,10 +39,10 @@ from core.commands.spec import get_spec
 from core.commands.builtin import run_command
 from core.geometry import mesh as mesh_ops
 from core.geometry.ops import subsample_indices
-from core.io.auto_ingest import MAX_FULL_POINTS, plan_ingest, tier_by_points
+from core.io.auto_ingest import plan_ingest, tier_by_points
 from core.io.measurements import write_measurements_csv
 from core.io.readers import ReadOptions, read_cloud, read_stream_bin
-from core.io.scanner import collect_files
+from core.io.scanner import collect_files, natural_key
 from core.model.entities import COLOR_MODES, CloudEntity, MeshEntity, ScalarField
 from core.pipeline import run_pipeline
 from ui.theme import build_stylesheet
@@ -56,8 +55,9 @@ from ui.widgets.param_dialog import ParamDialog
 from ui.widgets.transform_dialog import TransformDialog
 from ui.widgets.pipeline_dialog import PipelineDialog
 from ui.widgets.script_dialog import ScriptDialog
+from ui.widgets.frame_browser import FrameBrowser
 
-HELP_TEXT = """快捷键（沿用 vis_point_cloud.py 习惯）：
+HELP_TEXT = """快捷键：
   ←/↑  上一个点云        →/↓  下一个点云
   R    重置视角          H    显示本帮助
   C    循环颜色模式      B    开关裁剪范围
@@ -68,7 +68,9 @@ HELP_TEXT = """快捷键（沿用 vis_point_cloud.py 习惯）：
 测量：顶栏「测量」→ 点两个点测距；Esc 退出
 选点：顶栏「选点」→ 单击查看坐标与属性；Esc 退出
 文件：Ctrl+O 打开文件 · Ctrl+Shift+O 文件夹 · Ctrl+P 工程 · Ctrl+S 保存 · Ctrl+E 导出 · Ctrl+L 日志
-鼠标：左键拖拽旋转 · 右键拖拽平移 · 滚轮缩放
+鼠标：左键拖拽旋转 · 右键拖拽平移
+视角：自由视角绕中心旋转、滚轮缩放；固定视角锁定当前高度、原地水平转向、滚轮沿 XY 平面平滑前后移动
+裁剪：按包围盒后关闭面板，拖动橙色框面中央的圆点调整边界；Esc 取消本次拖动
 """
 
 
@@ -77,6 +79,7 @@ class LoadThread(QThread):
 
     progress = Signal(str, float)   # path, 0..1
     done = Signal(str, object)      # path, CloudEntity
+    preview = Signal(str, object)
     failed = Signal(str, str)       # path, error
 
     def __init__(self, path: str, options: ReadOptions, parent=None):
@@ -86,9 +89,23 @@ class LoadThread(QThread):
 
     def run(self):
         try:
-            entity = read_cloud(self.path, self.options,
-                                progress=lambda p: self.progress.emit(self.path, p),
-                                cancel=self.isInterruptionRequested)
+            plan = plan_ingest(self.path, self.options)
+            if self.isInterruptionRequested():
+                return
+            if plan.preview is not None:
+                self.preview.emit(self.path, plan.preview)
+            if plan.tier == "S" or plan.needs_full:
+                entity = read_cloud(self.path, self.options,
+                                    progress=lambda p: self.progress.emit(self.path, p),
+                                    cancel=self.isInterruptionRequested)
+            elif self.path.lower().endswith(".bin"):
+                entity = read_stream_bin(self.path, self.options, budget=2_000_000,
+                                         progress=lambda p: self.progress.emit(self.path, p),
+                                         cancel=self.isInterruptionRequested)
+            else:
+                entity = plan.preview
+            if entity is None:
+                raise ValueError("没有可读取的点云数据")
             if self.isInterruptionRequested():
                 return
             self.done.emit(self.path, entity)
@@ -97,30 +114,25 @@ class LoadThread(QThread):
                 self.failed.emit(self.path, str(exc))
 
 
-class StreamThread(QThread):
-    """超大 .bin：后台构建八叉树索引并按预算采样，避免全量进内存。"""
+class ScanThread(QThread):
+    done = Signal(list)
+    failed = Signal(str)
 
-    progress = Signal(str, float)
-    done = Signal(str, object)
-    failed = Signal(str, str)
-
-    def __init__(self, path: str, options: ReadOptions, budget: int = 2_000_000, parent=None):
+    def __init__(self, paths, parent=None):
         super().__init__(parent)
-        self.path = path
-        self.options = options
-        self.budget = int(budget)
+        self.paths = paths
 
     def run(self):
-        try:
-            entity = read_stream_bin(
-                self.path, self.options, budget=self.budget,
-                progress=lambda p: self.progress.emit(self.path, float(p)),
-                cancel=self.isInterruptionRequested)
-            if not self.isInterruptionRequested():
-                self.done.emit(self.path, entity)
-        except Exception as exc:  # noqa: BLE001
-            if not self.isInterruptionRequested():
-                self.failed.emit(self.path, str(exc))
+        files = []
+        for path in self.paths:
+            try:
+                files.extend(collect_files(path, cancel=self.isInterruptionRequested))
+            except OperationCancelled:
+                return
+            except Exception as exc:
+                self.failed.emit(f"收集失败: {path} — {exc}")
+        if not self.isInterruptionRequested():
+            self.done.emit(sorted(set(files), key=natural_key))
 
 
 class FilterThread(QThread):
@@ -199,6 +211,13 @@ class MainWindow(QMainWindow):
         self.options = ReadOptions()
         self._threads: dict = {}
         self._load_queue: list = []
+        self._scan_threads = []
+        self._frame_cache = {}
+        self._result_sources = WeakKeyDictionary()
+        self._camera_initialized = False
+        self._restoring_project = False
+        self._auto_mesh = None
+        self._explicit_loads = set()
         self._close_deadline: float | None = None
         self._eps_thread: EpsThread | None = None
         self._eps_cache: dict[str, float] = {}
@@ -236,7 +255,7 @@ class MainWindow(QMainWindow):
         body.setSpacing(10)
 
         self.scene_panel = ScenePanel()
-        self.scene_panel.setFixedWidth(272)
+        self.scene_panel.setFixedWidth(232)
 
         self.overview = OverviewPanel()
         self.overview_scroll = QScrollArea()
@@ -245,16 +264,19 @@ class MainWindow(QMainWindow):
         self.overview_scroll.setFrameShape(QScrollArea.NoFrame)
         self.overview_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.overview_scroll.setWidget(self.overview)
-        self.overview_scroll.setFixedWidth(312)
+        self.overview_scroll.setFixedWidth(292)
 
         body.addWidget(self.scene_panel)
-        body.addWidget(self.viewport, 1)
+        self.frame_browser = FrameBrowser(self.viewport)
+        body.addWidget(self.frame_browser, 1)
         body.addWidget(self.overview_scroll)
         root.addWidget(body_host, 1)
 
         self.log_view = QPlainTextEdit()
         self.log_view.setObjectName("logDrawer")
         self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(2000)
+        self.log_view.setMaximumHeight(180)
         self.log_view.hide()
         root.addWidget(self.log_view)
 
@@ -304,6 +326,10 @@ class MainWindow(QMainWindow):
         proj_menu.addAction("保存工程…", self._save_project_dialog)
         proj_menu.addSeparator()
         proj_menu.addAction("导出当前点云…", self._export_current_dialog)
+        self.act_export_clipped = proj_menu.addAction("导出裁剪内点云…", self._export_clipped_dialog)
+        self.act_export_clipped.setEnabled(False)
+        self.mesh_menu = proj_menu.addMenu("网格结果")
+        self.mesh_menu.aboutToShow.connect(self._populate_mesh_menu)
         proj_menu.addSeparator()
         proj_menu.addAction("退出", self.close)
         self.btn_project.setMenu(proj_menu)
@@ -390,6 +416,15 @@ class MainWindow(QMainWindow):
         self.btn_reset.clicked.connect(self.viewport.reset_view)
         self._register_icon(self.btn_reset, "refresh")
 
+        self.btn_navigation = QToolButton()
+        self.btn_navigation.setObjectName("headerBtn")
+        self.btn_navigation.setMinimumHeight(32)
+        self.btn_navigation.setText("自由视角")
+        self.btn_navigation.setCheckable(True)
+        self.btn_navigation.setToolTip("固定视角：锁定当前 Z 高度，拖动原地水平转向，滚轮沿 XY 平面平滑前后移动；自由视角：绕中心旋转和缩放")
+        self.btn_navigation.toggled.connect(self.viewport.set_fixed_view)
+        self.viewport.navigation_changed.connect(self._sync_navigation_button)
+
         self.btn_clip = QToolButton()
         self.btn_clip.setObjectName("headerBtn")
         self.btn_clip.setToolTip("裁剪范围 (B)：显示/隐藏裁剪线框")
@@ -427,6 +462,8 @@ class MainWindow(QMainWindow):
         self.act_grid = view_menu.addAction("显示地面网格")
         self.act_grid.setCheckable(True)
         self.act_grid.setChecked(True)
+        self.act_compare = view_menu.addAction("双窗格对比")
+        self.act_compare.setCheckable(True)
 
         cmap_menu = view_menu.addMenu("色彩映射")
         self._cmap_group = []
@@ -464,7 +501,7 @@ class MainWindow(QMainWindow):
         tool_layout.setSpacing(3)
         for widget in (self.cmb_color, self.sld_size, self.lbl_size,
                        self.btn_measure, self.btn_select, self.btn_box_select,
-                       self.btn_clip, self.btn_reset):
+                       self.btn_clip, self.btn_navigation, self.btn_reset):
             tool_layout.addWidget(widget)
 
         lay.addWidget(self.btn_open)
@@ -513,9 +550,11 @@ class MainWindow(QMainWindow):
         self.status_points = QLabel("0 点")
         self.status_points.setObjectName("metric")
         self.status_mode = QLabel("")
+        self.status_mode.setWordWrap(True)
         self.status_mode.setObjectName("metric")
         self.status_mode.setStyleSheet("")
         self.status_task = QLabel("")
+        self.status_task.setWordWrap(True)
         self.status_task.setObjectName("metric")
         self.status_mem = QLabel("0 MB")
         self.status_mem.setObjectName("metric")
@@ -525,6 +564,12 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.status_points)
         lay.addWidget(self.status_mode)
         lay.addWidget(self.status_task)
+        self.btn_cancel_task = QToolButton()
+        self.btn_cancel_task.setText("取消任务")
+        self.btn_cancel_task.setToolTip("请求取消当前处理；部分算法需等待当前计算阶段结束")
+        self.btn_cancel_task.clicked.connect(self._cancel_filter)
+        self.btn_cancel_task.hide()
+        lay.addWidget(self.btn_cancel_task)
         lay.addWidget(self.status_mem)
         lay.addWidget(self.status_fps)
         lay.addStretch(1)
@@ -545,6 +590,22 @@ class MainWindow(QMainWindow):
         return bar
 
     # ---------------- 裁剪范围弹层 ----------------
+    def _sync_navigation_button(self, enabled):
+        self.btn_navigation.blockSignals(True)
+        self.btn_navigation.setChecked(enabled)
+        self.btn_navigation.setText("固定视角" if enabled else "自由视角")
+        self.btn_navigation.blockSignals(False)
+
+    def _begin_clip_history(self):
+        self.clip_popup._timer.stop()
+        self._clip_commit_timer.stop()
+        self._commit_clip_history()
+        self.clip_popup.hide()
+
+    def _sync_dragged_clip(self, mn, mx):
+        self.clip_popup.set_values(mn, mx)
+        self.clip_popup.lbl_warning.hide()
+
     def _clip_state(self) -> dict:
         if self.clip_popup.is_enabled() and self.viewport._clip_box is not None:
             mn, mx = self.viewport._clip_box
@@ -603,6 +664,7 @@ class MainWindow(QMainWindow):
         self._update_history_buttons()
 
     def _show_clip_popup(self):
+        self.btn_clip.setChecked(self.clip_popup.is_enabled())
         if self.clip_popup.isVisible():
             self.clip_popup.hide()
             return
@@ -631,7 +693,7 @@ class MainWindow(QMainWindow):
         # 场景面板
         self.scene_panel.entity_selected.connect(self._on_selection_changed)
         self.scene_panel.visibility_changed.connect(self._on_visibility_changed)
-        self.scene_panel.focus_requested.connect(self.viewport.focus_entity)
+        self.scene_panel.focus_requested.connect(self._focus_entity)
         self.scene_panel.remove_requested.connect(self._remove_entity)
         self.scene_panel.reload_requested.connect(self._reload_entity)
         self.scene_panel.open_requested.connect(self._open_files_dialog)
@@ -640,6 +702,13 @@ class MainWindow(QMainWindow):
         self.cmb_color.currentIndexChanged.connect(self._on_header_color)
         self.sld_size.valueChanged.connect(self._on_header_size)
         self.act_grid.toggled.connect(self.viewport.set_grid_visible)
+        self.act_grid.toggled.connect(lambda checked: self.frame_browser.secondary.set_grid_visible(checked)
+                                     if self.frame_browser.secondary is not None else None)
+        self.act_compare.toggled.connect(self.frame_browser.compare.setChecked)
+        self.frame_browser.compare.toggled.connect(self.act_compare.setChecked)
+        self.frame_browser.previous_requested.connect(self._prev_entity)
+        self.frame_browser.next_requested.connect(self._next_entity)
+        self.frame_browser.comparison_changed.connect(self._update_frame_browser)
 
         # 裁剪范围弹层
         self.clip_popup.enabled_changed.connect(self._on_clip_enabled)
@@ -648,6 +717,10 @@ class MainWindow(QMainWindow):
         self.clip_popup.enabled_changed.connect(self._schedule_clip_commit)
         self.clip_popup.fill_requested.connect(self._clip_fill_from_scene)
         self.clip_popup.clear_requested.connect(self._clip_clear)
+        self.viewport.clip_drag_started.connect(self._begin_clip_history)
+        self.viewport.clip_dragged.connect(self._sync_dragged_clip)
+        self.viewport.clip_drag_finished.connect(self._commit_clip_history)
+        self.viewport.clip_statistics_changed.connect(self._on_clip_statistics)
 
         # 视口键盘
         self.viewport.key_next_file.connect(self._next_entity)
@@ -669,8 +742,30 @@ class MainWindow(QMainWindow):
 
     # ---------------- 选中与视图控件同步 ----------------
     def _on_selection_changed(self, entity):
-        self.overview.set_entity(entity)
-        self._sync_view_controls(entity)
+        if self._restoring_project:
+            return
+        if entity is not None:
+            for other in self.entities:
+                other.visible = other is entity or other.visibility_pinned
+            if self._auto_mesh is not None:
+                self._auto_mesh.visible = False
+                self.viewport._refresh_meshes()
+                self._auto_mesh = None
+            if entity in self._frame_cache:
+                self._frame_cache[entity] = time.monotonic()
+        self._show_entity(entity)
+        self._refresh_scene()
+        if entity is not None and entity.xyz is not None and not self._camera_initialized:
+            self.viewport.focus_entity(entity)
+            self._camera_initialized = True
+        self._schedule_frame_loads()
+
+    def _focus_entity(self, entity):
+        if entity.xyz is None:
+            self._focus_when_loaded = entity
+            self._schedule_frame_loads()
+        else:
+            self.viewport.focus_entity(entity)
 
     def _sync_view_controls(self, entity):
         self._sync_guard = True
@@ -761,6 +856,7 @@ class MainWindow(QMainWindow):
         self.lbl_size.setText(f"{entity.point_size:.1f}")
         self.overview.set_entity(entity)
         self.viewport.set_point_size()
+        self.frame_browser.set_reference(self._reference_entity())
 
     def _toggle_selected_visibility(self):
         entity = self.scene_panel.current_entity()
@@ -771,15 +867,18 @@ class MainWindow(QMainWindow):
 
     def _on_visibility_changed(self, entity):
         visible = entity.visible
+        pinned_before = entity.visibility_pinned
 
-        def apply(value):
+        def apply(value, pinned):
             entity.visible = value
+            entity.visibility_pinned = pinned
             self._refresh_scene()
+            self._schedule_frame_loads()
 
         self.history.push(f"显示/隐藏 {entity.name}",
-                          lambda: apply(not visible), lambda: apply(visible))
+                          lambda: apply(not visible, pinned_before), lambda: apply(visible, visible))
         self._update_history_buttons()
-        self._refresh_scene()
+        apply(visible, visible)
 
     # ---------------- P4：测量与选点 ----------------
     def _on_measure_toggled(self, checked: bool):
@@ -823,6 +922,7 @@ class MainWindow(QMainWindow):
             self.log("框选模式：拖拽矩形选择点（Esc 退出）")
 
     def _escape_tools(self):
+        self.viewport.cancel_clip_drag()
         if getattr(self.viewport, "_mode", None) is not None:
             self._set_tool(None)
 
@@ -950,121 +1050,140 @@ class MainWindow(QMainWindow):
 
     # ================= Auto-Ingest 加载 =================
     def open_paths(self, paths: list):
-        files = []
-        for p in paths:
-            if not p:
-                continue
-            try:
-                if os.path.isdir(p):
-                    files.extend(collect_files(p, recursive=True))
-                elif os.path.isfile(p):
-                    files.append(p)
-                else:
-                    self.log(f"路径不存在: {p}")
-            except Exception as exc:  # noqa: BLE001
-                self.log(f"收集失败: {p} — {exc}")
-
-        if not files:
-            self.log("没有找到支持的点云文件。")
-            return
-        self.log(f"收集到 {len(files)} 个点云文件。")
+        paths = [os.path.abspath(p) for p in paths if p]
         for source in paths:
-            if source and os.path.exists(source):
+            if os.path.exists(source):
                 self.settings.add_recent(source)
         self._rebuild_recent_menu()
-        for f in files:
-            self._ingest(f)
-
-    def _ingest(self, path: str):
-        path = os.path.abspath(path)
-        if path in self._threads or any(e.path == path for e in self.entities):
-            self.log(f"已在场景中，跳过: {os.path.basename(path)}")
-            return
-
-        try:
-            plan = plan_ingest(path, self.options)
-        except Exception as exc:  # noqa: BLE001
-            self.log(f"加载失败: {os.path.basename(path)} — {exc}")
-            return
-
-        if plan.tier == "S":
-            try:
-                entity = read_cloud(path, self.options)
-                self._add_entity(entity)
-                self.log(f"已加载: {entity.name}（{entity.point_count:,} 点 · {entity.info}）")
-            except Exception as exc:  # noqa: BLE001
-                self.log(f"加载失败: {os.path.basename(path)} — {exc}")
-            return
-
-        # M / L：先显示预览（若有），后台全量加载
-        if plan.preview is not None:
-            plan.preview.tier = plan.tier
-            self._add_entity(plan.preview)
-            self.log(f"预览已就绪: {plan.preview.name}（{plan.preview.point_count:,} 点），后台加载中…")
-
-        if plan.needs_full:
-            if len(self._threads) >= self.MAX_LOAD_THREADS:
-                self._queue_full_load(path)
-            else:
-                self._start_full_load(path)
+        if any(os.path.isdir(p) for p in paths):
+            thread = ScanThread(paths, self)
+            self._scan_threads.append(thread)
+            thread.done.connect(self._register_files)
+            thread.failed.connect(self.log)
+            thread.finished.connect(lambda t=thread: self._finish_scan(t))
+            self.log("正在扫描文件夹…")
+            thread.start()
         else:
-            if path.lower().endswith(".bin"):
-                self._start_stream_load(path)
-            else:
-                self.log(f"{os.path.basename(path)} 约 {plan.total_points:,} 点，超过内存阈值"
-                         f"（{MAX_FULL_POINTS:,}），已按采样显示。")
+            self._register_files(paths)
 
-    def _start_stream_load(self, path: str):
-        if self._closing or path in self._threads:
-            return
-        thread = StreamThread(path, self.options, parent=self)
-        thread.progress.connect(self._on_load_progress)
-        thread.done.connect(self._on_stream_loaded)
-        thread.failed.connect(self._on_load_failed)
-        thread.finished.connect(lambda p=path: self._on_thread_finished(p))
-        self._threads[path] = thread
-        thread.start()
-        self.log(f"后台构建八叉树索引: {os.path.basename(path)}")
+    def _finish_scan(self, thread):
+        if thread in self._scan_threads:
+            self._scan_threads.remove(thread)
+        thread.deleteLater()
 
-    def _on_stream_loaded(self, path: str, entity):
+    def _register_files(self, files):
         if self._closing:
             return
-        old = next((e for e in self.entities if e.path == path), None)
-        if old is not None:
-            was_current = self.scene_panel.current_entity() is old
-            old.xyz, old.fields = entity.xyz, entity.fields
-            old.info, old.debug = entity.info, entity.debug
-            old.dim_hint, old.tier, old.loaded = entity.dim_hint, entity.tier, entity.loaded
-            entity = old
-            self.scene_panel.update_entity(entity)
-            if was_current:
-                self.scene_panel.select_entity(entity)
-                self._show_entity(entity)
-        else:
-            self._add_entity(entity)
-        self._apply_pending(entity)
+        known = {os.path.normcase(e.path) for e in self.entities if e.path}
+        added = []
+        self.scene_panel.list.setUpdatesEnabled(False)
+        try:
+            for path in sorted(set(files), key=natural_key):
+                path = os.path.abspath(path)
+                key = os.path.normcase(path)
+                if key in known:
+                    continue
+                known.add(key)
+                entity = CloudEntity(os.path.basename(path), path=path, visible=False,
+                                     load_state="unloaded", loaded=0.0)
+                self._apply_pending(entity)
+                self.entities.append(entity)
+                self._frame_cache[entity] = time.monotonic()
+                self.scene_panel.add_entity(entity)
+                added.append(entity)
+        finally:
+            self.scene_panel.list.setUpdatesEnabled(True)
+        if added:
+            self.log(f"已列出 {len(added)} 帧，按浏览位置加载。")
+            if not self._restoring_project:
+                self.scene_panel.select_entity(added[0])
+        elif not files:
+            self.log("没有找到支持的点云文件。")
         self._refresh_scene()
-        self.log(f"流式加载完成: {entity.name}（{entity.point_count:,} 采样 · {entity.info}）")
+        if not self._restoring_project:
+            self._schedule_frame_loads()
+
+    def _ingest(self, path: str):
+        self._register_files([path])
 
     MAX_LOAD_THREADS = 2
+    FRAME_CACHE_COUNT = 8
+    FRAME_CACHE_BYTES = 512 * 1024 * 1024
+
+    def _reference_entity(self):
+        if not self.frame_browser.compare.isChecked():
+            return None
+        current = self.scene_panel.current_entity()
+        if current not in self.entities:
+            return None
+        index = self.entities.index(current) + self.frame_browser.direction.currentData()
+        return self.entities[index] if 0 <= index < len(self.entities) else None
+
+    def _update_frame_browser(self):
+        current = self.scene_panel.current_entity()
+        index = self.entities.index(current) if current in self.entities else -1
+        self.frame_browser.set_current(current, index, len(self.entities))
+        self.frame_browser.set_reference(self._reference_entity())
+        self._schedule_frame_loads()
+
+    def _wanted_frames(self):
+        current = self.scene_panel.current_entity()
+        wanted = [current, self._reference_entity()]
+        wanted.extend(self._explicit_loads)
+        wanted.extend(e for e in self.entities if e.visible)
+        if current in self.entities:
+            index = self.entities.index(current)
+            wanted.extend(self.entities[i] for i in (index + 1, index - 1)
+                          if 0 <= i < len(self.entities))
+        return list(dict.fromkeys(e for e in wanted if e is not None))
+
+    def _schedule_frame_loads(self):
+        if self._closing or self._restoring_project:
+            return
+        wanted = self._wanted_frames()
+        for thread in self._threads.values():
+            if thread.entity not in wanted:
+                thread.requestInterruption()
+        self._load_queue = [e.path for e in wanted if e.path and e.load_state == "unloaded"]
+        self._pump_load_queue()
+
+    def _evict_frame_cache(self):
+        if self._filter_thread is not None:
+            return
+        protected = set(self._wanted_frames())
+        live = set(self.entities)
+        candidates = [e for e in self._frame_cache if e.xyz is not None and e in live]
+        sizes = {e: e.xyz.nbytes + sum(f.data.nbytes for f in e.fields.values()) for e in candidates}
+        total = sum(sizes.values())
+        count = len(candidates)
+        for entity in sorted(candidates, key=self._frame_cache.get):
+            if count <= self.FRAME_CACHE_COUNT and total <= self.FRAME_CACHE_BYTES:
+                break
+            if entity in protected or entity.path in self._threads:
+                continue
+            total -= sizes[entity]
+            count -= 1
+            entity.xyz, entity.fields = None, {}
+            entity.load_state, entity.loaded = "unloaded", 0.0
+            self.scene_panel.update_entity(entity)
 
     def _start_full_load(self, path: str):
         if self._closing or path in self._threads:
             return
+        entity = next((e for e in self.entities if e.path == path), None)
+        if entity is None or entity.load_state != "unloaded":
+            return
         thread = LoadThread(path, self.options, self)
+        thread.entity = entity
+        entity.load_state = "loading"
+        self.scene_panel.update_entity(entity)
         thread.progress.connect(self._on_load_progress)
+        thread.preview.connect(self._on_preview_loaded)
         thread.done.connect(self._on_full_loaded)
         thread.failed.connect(self._on_load_failed)
         thread.finished.connect(lambda p=path: self._on_thread_finished(p))
         self._threads[path] = thread
         thread.start()
-        self.log(f"后台加载: {os.path.basename(path)}")
-
-    def _queue_full_load(self, path: str):
-        if path in self._load_queue:
-            return
-        self._load_queue.append(path)
-        self.log(f"已排队（{len(self._load_queue)}）: {os.path.basename(path)}")
 
     def _pump_load_queue(self):
         if self._closing:
@@ -1072,9 +1191,7 @@ class MainWindow(QMainWindow):
             return
         while self._load_queue and len(self._threads) < self.MAX_LOAD_THREADS:
             path = self._load_queue.pop(0)
-            if path in self._threads or not os.path.isfile(path):
-                continue
-            if any(e.path == path and not e.is_preview for e in self.entities):
+            if path in self._threads:
                 continue
             self._start_full_load(path)
 
@@ -1082,56 +1199,72 @@ class MainWindow(QMainWindow):
         self.entities.append(entity)
         self._apply_pending(entity)
         self.scene_panel.add_entity(entity)
-        self.scene_panel.select_entity(entity)
-        self._show_entity(entity)
-        self._refresh_scene()
-        if len(self.entities) == 1:
-            self.viewport.reset_view()
+        if not self._restoring_project:
+            self.scene_panel.select_entity(entity)
+            if not self._camera_initialized and entity.xyz is not None:
+                self.viewport.reset_view()
+                self._camera_initialized = True
+
+    def _accept_loaded(self, path, fresh, *, complete):
+        thread = self._threads.get(path)
+        if self._closing or thread is None or thread.isInterruptionRequested():
+            return
+        entity = thread.entity
+        if entity not in self.entities:
+            return
+        for name in ("xyz", "fields", "info", "debug", "dim_hint", "tier", "loaded"):
+            setattr(entity, name, getattr(fresh, name))
+        entity.load_state = "ready" if complete else "loading"
+        self._frame_cache[entity] = time.monotonic()
+        self.scene_panel.update_entity(entity)
+        if entity is self.scene_panel.current_entity():
+            self._show_entity(entity)
+        if entity.visible or entity is self._reference_entity():
+            self._refresh_scene()
+        if entity is self.scene_panel.current_entity() and (
+                not self._camera_initialized or getattr(self, "_focus_when_loaded", None) is entity):
+            self.viewport.focus_entity(entity)
+            self._camera_initialized = True
+            self._focus_when_loaded = None
+
+    def _on_preview_loaded(self, path, entity):
+        self._accept_loaded(path, entity, complete=False)
 
     def _on_full_loaded(self, path: str, entity: CloudEntity):
-        thread = self._threads.get(path)
-        if self._closing or (thread is not None and thread.isInterruptionRequested()):
-            return
-        entity.tier = tier_by_points(entity.point_count)
-        old = next((e for e in self.entities if e.path == path), None)
-        if old is not None:
-            was_current = self.scene_panel.current_entity() is old
-            old.xyz, old.fields = entity.xyz, entity.fields
-            old.info, old.debug = entity.info, entity.debug
-            old.dim_hint, old.tier, old.loaded = entity.dim_hint, entity.tier, 1.0
-            entity = old
-            self.scene_panel.update_entity(entity)
-            if was_current:
-                self.scene_panel.select_entity(entity)
-                self._show_entity(entity)
-        else:
-            self._add_entity(entity)
-
-        self._apply_pending(entity)
-        self._refresh_scene()
-        self.log(f"加载完成: {entity.name}（{entity.point_count:,} 点 · {entity.info}）")
+        self._accept_loaded(path, entity, complete=True)
 
     def _on_load_failed(self, path: str, error: str):
+        thread = self._threads.get(path)
+        if thread is not None and thread.entity in self.entities:
+            thread.entity.load_state = "error"
+            self.scene_panel.update_entity(thread.entity)
+            if thread.entity is self.scene_panel.current_entity():
+                self._show_entity(thread.entity)
+            self._update_frame_browser()
         self.log(f"后台加载失败: {os.path.basename(path)} — {error}")
+        self._flash_status(f"后台加载失败：{os.path.basename(path)}，详情见日志", 6000)
 
     def _on_thread_finished(self, path: str):
         """线程真正结束后再释放（避免 QThread 在运行中被 GC 销毁）。"""
         thread = self._threads.pop(path, None)
         if thread is not None:
+            if thread.entity.load_state == "loading":
+                thread.entity.load_state = "unloaded"
             thread.deleteLater()
-        self._pump_load_queue()
+        self._evict_frame_cache()
+        self._schedule_frame_loads()
+        self._update_status()
 
     def _on_load_progress(self, path: str, fraction: float):
         entity = next((e for e in self.entities if e.path == path), None)
         if entity is not None:
-            entity.loaded = fraction
             self.overview.set_loading_progress(entity, fraction)
-            self._update_status()
 
     def _apply_pending(self, entity: CloudEntity):
         state = self._pending_display.pop(entity.path, None)
         if state:
             entity.visible = state.get("visible", True)
+            entity.visibility_pinned = state.get("visibility_pinned", entity.visible)
             entity.color_mode = state.get("color_mode", "auto")
             entity.colormap = state.get("colormap", "default")
             entity.color_field = state.get("color_field", "")
@@ -1151,6 +1284,7 @@ class MainWindow(QMainWindow):
         if entity.path in self._load_queue:
             self._load_queue.remove(entity.path)
         self.entities.remove(entity)
+        self._frame_cache.pop(entity, None)
         self.scene_panel.remove_entity(entity)
         self._show_entity(self.scene_panel.current_entity())
         self._refresh_scene()
@@ -1158,6 +1292,8 @@ class MainWindow(QMainWindow):
 
         def undo():
             self.entities.insert(min(index, len(self.entities)), entity)
+            if entity.path:
+                self._frame_cache[entity] = time.monotonic()
             entity.visible = was_visible
             self.scene_panel.set_entities(self.entities)
             self.scene_panel.select_entity(entity)
@@ -1176,6 +1312,11 @@ class MainWindow(QMainWindow):
             self.log("无法重新加载：该点云没有源文件")
             self._flash_status("无法重新加载：没有源文件")
             return
+        if entity.xyz is None:
+            entity.load_state = "unloaded"
+            self.scene_panel.select_entity(entity)
+            self._schedule_frame_loads()
+            return
         if self._filter_thread is not None:
             self.log("已有处理任务在进行，请稍候")
             return
@@ -1187,7 +1328,7 @@ class MainWindow(QMainWindow):
         thread = FilterThread(worker, self)
         thread.done.connect(lambda fresh: self._apply_reload(entity, fresh))
         thread.failed.connect(self._on_filter_failed)
-        thread.cancelled.connect(lambda: self.log(f"{title}已取消"))
+        thread.cancelled.connect(lambda: self.log("重新加载已取消"))
         thread.finished.connect(self._on_filter_finished)
         self._filter_thread = thread
         self.log(f"重新加载: {entity.name}…")
@@ -1196,7 +1337,7 @@ class MainWindow(QMainWindow):
     def _apply_reload(self, entity: CloudEntity, fresh: CloudEntity):
         if self._closing or entity not in self.entities:
             return
-        attributes = ("xyz", "fields", "info", "debug", "loaded", "dim_hint", "tier")
+        attributes = ("xyz", "fields", "info", "debug", "loaded", "dim_hint", "tier", "load_state")
         before = {name: getattr(entity, name) for name in attributes}
         after = {name: getattr(fresh, name) for name in attributes}
         after["tier"] = tier_by_points(fresh.point_count)
@@ -1218,18 +1359,16 @@ class MainWindow(QMainWindow):
             return
         cur = self.scene_panel.current_entity()
         idx = self.entities.index(cur) if cur in self.entities else -1
-        nxt = self.entities[(idx + 1) % len(self.entities)]
+        nxt = self.entities[min(idx + 1, len(self.entities) - 1)]
         self.scene_panel.select_entity(nxt)
-        self._show_entity(nxt)
 
     def _prev_entity(self):
         if not self.entities:
             return
         cur = self.scene_panel.current_entity()
         idx = self.entities.index(cur) if cur in self.entities else 0
-        prv = self.entities[(idx - 1) % len(self.entities)]
+        prv = self.entities[max(0, idx - 1)]
         self.scene_panel.select_entity(prv)
-        self._show_entity(prv)
 
     def _cycle_color(self):
         targets = self.entities if not self.scene_panel.current_entity() else [self.scene_panel.current_entity()]
@@ -1279,9 +1418,15 @@ class MainWindow(QMainWindow):
         bounds = [e.bounds() for e in self.entities if e.visible and e.xyz is not None and len(e.xyz)]
         if not bounds:
             self.log("场景中没有可见点云，无法按包围盒填充")
+            self.clip_popup.set_enabled(False)
+            self.btn_clip.setChecked(False)
+            self._flash_status("请先打开并显示一片点云")
             return
         mn = np.min([b[0] for b in bounds], axis=0)
         mx = np.max([b[1] for b in bounds], axis=0)
+        padding = np.maximum(np.maximum(np.abs(mn), np.abs(mx)) * 1e-6, 0.001)
+        flat = mx - mn < padding
+        mn, mx = np.where(flat, mn - padding, mn), np.where(flat, mx + padding, mx)
         self.clip_popup.set_values(mn, mx)
         if not self.clip_popup.is_enabled():
             self.clip_popup.set_enabled(True)
@@ -1290,6 +1435,7 @@ class MainWindow(QMainWindow):
             self.btn_clip.blockSignals(False)
         self.viewport.set_clip_box(mn, mx)
         self.log("裁剪范围已按包围盒填充")
+        self._schedule_clip_commit()
 
     def _clip_clear(self):
         self.clip_popup.set_enabled(False)
@@ -1298,13 +1444,47 @@ class MainWindow(QMainWindow):
         self.btn_clip.blockSignals(False)
         self.viewport.clear_clip_box()
         self.log("裁剪范围已关闭")
+        self._schedule_clip_commit()
 
     # ================= 处理命令（P2：滤波 + 撤销/重做） =================
     def _current_entity(self):
         entity = self.scene_panel.current_entity()
         if entity is None:
             self.log("请先在左侧场景中选择一片点云")
+            self._flash_status("请先在左侧选择一片点云")
+        elif entity.load_state != "ready" or entity.xyz is None:
+            self._schedule_frame_loads()
+            self._flash_status("当前帧尚未加载完成；失败时可右键重新加载", 4000)
+            return None
         return entity
+
+    def _load_reference(self, entity):
+        if entity.load_state == "ready" and entity.xyz is not None:
+            return True
+        if entity.load_state == "error":
+            entity.load_state = "unloaded"
+        progress = QProgressDialog(f"正在加载参考点云：{entity.name}", "取消", 0, 0, self)
+        progress.setWindowTitle("加载参考点云")
+        progress.setMinimumDuration(0)
+        timer = QTimer(progress)
+        timer.setInterval(50)
+
+        def check():
+            if entity.load_state == "ready":
+                progress.accept()
+            elif entity.load_state == "error" or self._closing:
+                progress.reject()
+
+        self._explicit_loads.add(entity)
+        self._schedule_frame_loads()
+        timer.timeout.connect(check)
+        timer.start()
+        try:
+            return progress.exec() == QDialog.Accepted and entity.xyz is not None
+        finally:
+            timer.stop()
+            self._explicit_loads.discard(entity)
+            self._schedule_frame_loads()
 
     @staticmethod
     def _subset_fields(source: CloudEntity, index) -> dict:
@@ -1328,6 +1508,7 @@ class MainWindow(QMainWindow):
             entity.tier = source.tier
             info = f"{info}；基于 {int(source.loaded * 100)}% 预览".strip("；")
         entity.info = info
+        self._result_sources[entity] = source
         return entity
 
     def _run_filter(self, title: str, worker, command: Command | None = None):
@@ -1335,6 +1516,9 @@ class MainWindow(QMainWindow):
             self.log("已有处理任务在进行，请稍候")
             return
         thread = FilterThread(worker, self)
+        self.status_task.setText(f"{title}…")
+        self.btn_cancel_task.setEnabled(True)
+        self.btn_cancel_task.show()
         thread.progress.connect(lambda f: self.status_task.setText(f"{title} {f:.0%}"))
         thread.done.connect(lambda e: self._on_filter_done(title, e, command))
         thread.failed.connect(self._on_filter_failed)
@@ -1347,8 +1531,34 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         if isinstance(entity, MeshEntity):
-            self.meshes.append(entity)
-            self.viewport.add_mesh_entity(entity)
+            visibility = [(e, e.visible) for e in self.entities]
+            previous_mesh = self._auto_mesh
+
+            def show_result():
+                for cloud in self.entities:
+                    if not cloud.visibility_pinned:
+                        cloud.visible = False
+                if previous_mesh is not None:
+                    previous_mesh.visible = False
+                self._auto_mesh = entity
+                entity.visible = True
+                self._add_mesh(entity)
+                self._refresh_scene()
+
+            def undo_result():
+                self._remove_mesh(entity)
+                self._auto_mesh = previous_mesh
+                if previous_mesh is not None:
+                    previous_mesh.visible = True
+                    self.viewport._refresh_meshes()
+                for cloud, visible in visibility:
+                    if cloud in self.entities:
+                        cloud.visible = visible
+                self._refresh_scene()
+
+            show_result()
+            self.history.push(f"添加 {entity.name}", undo_result, show_result)
+            self._update_history_buttons()
             self.log(f"{title}完成: {entity.name}（{entity.vertex_count:,} 顶点 / {entity.triangle_count:,} 三角面）已加入场景")
             if entity.info:
                 self.log(f"  {entity.info}")
@@ -1363,18 +1573,31 @@ class MainWindow(QMainWindow):
 
     def _on_filter_failed(self, error: str):
         self.log(f"处理失败: {error}")
+        self._flash_status(f"处理失败：{error}", 6000)
         self._update_status()
 
     def _on_filter_finished(self):
         if self._filter_thread is not None:
             self._filter_thread.deleteLater()
         self._filter_thread = None
+        self._evict_frame_cache()
+        self.btn_cancel_task.hide()
+        self.status_task.clear()
         self._update_status()
+
+    def _cancel_filter(self):
+        if self._filter_thread is not None:
+            self._filter_thread.requestInterruption()
+            self.btn_cancel_task.setEnabled(False)
+            self.status_task.setText("正在取消，请稍候…")
 
     # ---------------- 撤销 / 重做 ----------------
     def _push_add_history(self, entity: CloudEntity, command: Command | None = None):
         def undo():
             self._remove_entity_now(entity)
+            source = self._result_sources.get(entity)
+            if source in self.entities:
+                self.scene_panel.select_entity(source)
 
         def redo():
             self._add_entity(entity)
@@ -1391,6 +1614,9 @@ class MainWindow(QMainWindow):
         self.btn_redo.setToolTip("重做 (Ctrl+Shift+Z)" if can_redo else "重做 (Ctrl+Shift+Z) — 暂无可重做操作")
 
     def _undo(self):
+        if self._clip_commit_timer.isActive():
+            self._clip_commit_timer.stop()
+            self._commit_clip_history()
         label = self.history.undo()
         if label is None:
             self.log("没有可撤销的操作")
@@ -1427,6 +1653,7 @@ class MainWindow(QMainWindow):
             thread.requestInterruption()
         if entity in self.entities:
             self.entities.remove(entity)
+        self._frame_cache.pop(entity, None)
         self.scene_panel.remove_entity(entity)
         self._show_entity(self.scene_panel.current_entity())
         self._refresh_scene()
@@ -1549,6 +1776,8 @@ class MainWindow(QMainWindow):
         if source is None:
             return
         mn, mx = source.bounds()
+        if self.viewport._clip_box is not None:
+            mn, mx = self.viewport._clip_box
         fields = [
             {"key": "xmin", "label": "X min", "default": float(mn[0]), "decimals": 2},
             {"key": "xmax", "label": "X max", "default": float(mx[0]), "decimals": 2},
@@ -1580,6 +1809,15 @@ class MainWindow(QMainWindow):
     # ---------------- P3：分割与配准 ----------------
     def _copy_fields(self, source: CloudEntity) -> dict:
         return {name: ScalarField(name, f.data, kind=f.kind) for name, f in source.fields.items()}
+
+    def _transformed_fields(self, source, transform):
+        fields = self._copy_fields(source)
+        if "normal" in fields:
+            normals = np.asarray(fields["normal"].data, dtype=np.float64)
+            normals = normals @ np.linalg.inv(np.asarray(transform)[:3, :3])
+            normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+            fields["normal"] = ScalarField("normal", normals.astype(np.float32), kind="normal")
+        return fields
 
     def _process_plane(self):
         source = self._current_entity()
@@ -1645,7 +1883,7 @@ class MainWindow(QMainWindow):
             self.log("正在估算邻域半径，请稍候")
             return
         min_pts_default = 10
-        key = f"{id(source)}:{source.point_count}:{min_pts_default}"
+        key = f"{id(source.xyz)}:{source.point_count}:{min_pts_default}"
         cached = self._eps_cache.get(key)
         if cached is not None:
             self._open_dbscan_dialog(source, cached)
@@ -1664,40 +1902,34 @@ class MainWindow(QMainWindow):
         progress.setAutoReset(False)
         thread = EpsThread(source.xyz, min_pts_default, self)
         self._eps_thread = thread
-        closed = {"done": False}
+        outcome = {"cancelled": False, "eps": None, "error": None}
 
-        def cleanup():
-            if closed["done"]:
-                return
-            closed["done"] = True
-            progress.close()
+        def on_finished():
+            progress.hide()
+            progress.deleteLater()
             thread.deleteLater()
             if self._eps_thread is thread:
                 self._eps_thread = None
-
-        def on_done(eps):
-            cleanup()
-            if self._closing:
+            if self._closing or outcome["cancelled"] or source not in self.entities:
                 return
+            if outcome["error"]:
+                self.log(f"邻域半径估算失败: {outcome['error']}")
+            eps = outcome["eps"] if outcome["eps"] is not None else 0.5
             self._eps_cache[key] = eps
             self._open_dbscan_dialog(source, eps)
 
-        def on_failed(msg):
-            cleanup()
-            if not self._closing:
-                self.log(f"邻域半径估算失败: {msg}")
-                self._open_dbscan_dialog(source, 0.5)
-
         def on_cancel():
+            outcome["cancelled"] = True
             thread.requestInterruption()
-            cleanup()
             self.log("已取消邻域半径估算")
 
-        thread.done.connect(on_done)
-        thread.failed.connect(on_failed)
+        thread.done.connect(lambda eps: outcome.update(eps=eps))
+        thread.failed.connect(lambda error: outcome.update(error=error))
+        thread.finished.connect(on_finished)
         progress.canceled.connect(on_cancel)
         self.log("正在估算 DBSCAN 邻域半径…")
         thread.start()
+        progress.show()
 
     def _open_dbscan_dialog(self, source: CloudEntity, eps_default: float):
         min_pts_default = 10
@@ -1756,6 +1988,8 @@ class MainWindow(QMainWindow):
         params = dlg.values()
         target = others[int(params["target"])]
         iters = int(params["iters"])
+        if not self._load_reference(target):
+            return
 
         def worker(progress, cancel):
             normals = None
@@ -1773,7 +2007,7 @@ class MainWindow(QMainWindow):
             xyz = registration.apply_transform(source.xyz, transform)
             kind = "ICP精配准" if plane else "ICP配准"
             return self._make_result(
-                source, kind, xyz, self._copy_fields(source),
+                source, kind, xyz, self._transformed_fields(source, transform),
                 f"{kind} → {target.name}｜RMSE={rmse:.6f}" + chr(10)
                 + np.array2string(transform, precision=4, suppress_small=True))
 
@@ -1803,22 +2037,27 @@ class MainWindow(QMainWindow):
         target = others[int(params["target"])]
         voxel = float(params["voxel"])
         iters = int(params["iters"])
+        if not self._load_reference(target):
+            return
 
         def worker(progress, cancel):
             transform, fitness, fit_rmse = registration.global_registration(
                 source.xyz, target.xyz, voxel_size=voxel, progress=progress, cancel=cancel)
+            if fitness <= 0 or not np.isfinite(fit_rmse):
+                raise ValueError("未找到可靠匹配，请检查重叠区域或调整体素大小")
             note = (f"FPFH+RANSAC → {target.name}｜fitness={fitness:.3f}｜"
                     f"inlier RMSE={fit_rmse:.4f}")
             if iters > 0:
                 refined, rmse = registration.icp_point_to_plane(
                     source.xyz, target.xyz, max_iterations=iters,
+                    max_corr_distance=voxel * 1.5, initial_transform=transform,
                     progress=progress, cancel=cancel)
-                if rmse <= fit_rmse or fitness > 0.3:
+                if np.isfinite(rmse):
                     transform = refined
-                    note += f"｜精修 RMSE={rmse:.6f}"
+                    note += f"｜精修点面 RMSE={rmse:.6f}"
             xyz = registration.apply_transform(source.xyz, transform)
             return self._make_result(
-                source, "全局配准", xyz, self._copy_fields(source),
+                source, "全局配准", xyz, self._transformed_fields(source, transform),
                 note + chr(10) + np.array2string(transform, precision=4, suppress_small=True))
 
         self._run_filter("全局配准", worker)
@@ -1831,9 +2070,14 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
         matrix = dlg.matrix()
+        try:
+            fields = self._transformed_fields(source, matrix)
+        except np.linalg.LinAlgError:
+            self._flash_status("变换矩阵不可逆，无法变换法线", 5000)
+            return
         xyz = registration.apply_transform(source.xyz, matrix)
         entity = self._make_result(
-            source, "变换", xyz, self._copy_fields(source),
+            source, "变换", xyz, fields,
             "应用 4×4 变换" + chr(10)
             + np.array2string(matrix, precision=5, suppress_small=True))
         self._add_entity(entity)
@@ -1853,7 +2097,7 @@ class MainWindow(QMainWindow):
         k = int(dlg.values()["k"])
 
         def worker(progress, cancel):
-            normals = mesh_ops.estimate_normals(source.xyz, k=k)
+            normals = mesh_ops.estimate_normals(source.xyz, k=k, progress=progress, cancel=cancel)
             fields = self._copy_fields(source)
             fields["normal"] = ScalarField("normal", normals, kind="normal")
             return self._make_result(source, "法线", source.xyz.copy(), fields,
@@ -1876,6 +2120,8 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
         target = others[int(dlg.values()["target"])]
+        if not self._load_reference(target):
+            return
 
         def worker(progress, cancel):
             dist = mesh_ops.c2c_distance(source.xyz, target.xyz)
@@ -1954,7 +2200,7 @@ class MainWindow(QMainWindow):
             if not out.lower().endswith(".ply"):
                 out += ".ply"
         normals = source.field("normal")
-        normals = np.asarray(normals.data) if normals is not None else None
+        normals = np.asarray(normals) if normals is not None else None
 
         def worker(progress, cancel):
             verts, tris = mesh_ops.poisson_mesh(source.xyz, normals=normals, depth=depth)
@@ -2060,9 +2306,10 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
 
     def _show_about(self):
+        from core import __version__
         QMessageBox.about(
             self, tr("关于 PointLab Studio"),
-            "<b>PointLab Studio 0.7</b><br>点云浏览、处理、测量与配准工作站。<br><br>"
+            f"<b>PointLab Studio {__version__}</b><br>点云浏览、处理、测量与配准工作站。<br><br>"
             "渲染 pygfx/wgpu · 算法 numpy/scipy/Open3D<br>"
             f"设置文件：{self.settings_path_hint()}")
 
@@ -2074,6 +2321,7 @@ class MainWindow(QMainWindow):
         self.theme = theme
         QApplication.instance().setStyleSheet(build_stylesheet(theme))
         self.viewport.set_theme(theme)
+        self.frame_browser.set_theme(theme)
         self.btn_theme.setToolTip("切换主题（当前：深色）" if theme == "dark" else "切换主题（当前：浅色）")
         self._apply_icons()
         self.settings.theme = theme
@@ -2089,7 +2337,8 @@ class MainWindow(QMainWindow):
     def _refresh_scene(self):
         for entity in self.entities:
             self.scene_panel.update_entity(entity)
-        self.viewport.set_entities(self.entities)
+        self.viewport.set_entities([e for e in self.entities if e.visible and e.xyz is not None])
+        self._update_frame_browser()
         self._update_status()
 
     def _on_fps(self, fps: float):
@@ -2097,18 +2346,38 @@ class MainWindow(QMainWindow):
 
     def _update_status(self):
         total = sum(e.point_count for e in self.entities)
-        preview = sum(1 for e in self.entities if e.is_preview)
+        preview = sum(1 for e in self.entities if e.xyz is not None and e.is_preview)
         mem = sum(e.xyz.nbytes for e in self.entities if e.xyz is not None)
         for e in self.entities:
             mem += sum(f.data.nbytes for f in e.fields.values())
+        mem += sum(m.vertices.nbytes + m.triangles.nbytes for m in self.meshes)
 
-        self.status_points.setText(f"{total:,} 点" + (f"（{preview} 片预览）" if preview else ""))
+        self.status_points.setText(f"已加载 {total:,} 点" + (f"（{preview} 片预览）" if preview else ""))
         self.status_mem.setText(f"{mem / 1024**2:,.0f} MB")
-        self.status_task.setText("")
         try:
             self.overview.set_scene_stats(len(self.entities), total, mem)
         except Exception:
             pass
+        self._show_clip_statistics()
+        if self.meshes:
+            self.overview.v_scene.setText(self.overview.v_scene.text() + f" · {len(self.meshes)} 个网格")
+
+    def _on_clip_statistics(self, statistics):
+        self.act_export_clipped.setEnabled(self.viewport._clip_box is not None)
+        self._clip_statistics = statistics
+        self.overview.set_clip_statistics(statistics)
+        self.scene_panel.set_clip_statistics(statistics)
+        self._update_status()
+
+    def _show_clip_statistics(self):
+        statistics = getattr(self, "_clip_statistics", {})
+        if self.viewport._clip_box is None or not statistics:
+            return
+        visible = [e for e in self.entities if e.visible]
+        count = sum(statistics.get(id(e), (0, None))[0] for e in visible)
+        original = sum(e.point_count for e in visible)
+        self.status_points.setText(f"裁剪后 {count:,} 点 / 原始 {original:,} 点")
+        self.overview.v_scene.setText(f"{len(visible)} 片可见 · 裁剪后 {count:,} 点 / 原始 {original:,} 点")
 
     # ================= 文件 =================
     def _open_files_dialog(self):
@@ -2160,20 +2429,29 @@ class MainWindow(QMainWindow):
             path += ".pls"
         base = os.path.dirname(os.path.abspath(path))
         try:
-            files, derived = [], []
+            files, derived, meshes = [], [], []
             asset_dir = os.path.splitext(os.path.abspath(path))[0] + ".assets"
             for index, e in enumerate(self.entities):
                 entry = {
                     "name": e.name,
+                    "order": index,
                     "visible": bool(e.visible),
+                    "visibility_pinned": e.visibility_pinned,
                     "color_mode": e.color_mode,
                     "colormap": e.colormap,
                     "color_field": e.color_field,
                     "color_range": e.color_range,
                     "point_size": float(e.point_size),
+                    "loaded": float(e.loaded),
+                    "tier": e.tier,
+                    "info": e.info,
                 }
                 if e.path:
-                    entry["path"] = os.path.relpath(os.path.abspath(e.path), base).replace(os.sep, "/")
+                    try:
+                        source_path = os.path.relpath(os.path.abspath(e.path), base)
+                    except ValueError:
+                        source_path = os.path.abspath(e.path)
+                    entry["path"] = source_path.replace(os.sep, "/")
                     files.append(entry)
                     continue
                 if e.xyz is None or not len(e.xyz):
@@ -2184,6 +2462,15 @@ class MainWindow(QMainWindow):
                 self._write_asset(e, os.path.join(asset_dir, asset))
                 entry["asset"] = f"{os.path.basename(asset_dir)}/{asset}"
                 derived.append(entry)
+
+            for index, mesh in enumerate(self.meshes):
+                os.makedirs(asset_dir, exist_ok=True)
+                asset = f"mesh_{index:02d}.npz"
+                np.savez_compressed(os.path.join(asset_dir, asset),
+                                    vertices=mesh.vertices, triangles=mesh.triangles)
+                meshes.append({"name": mesh.name, "asset": f"{os.path.basename(asset_dir)}/{asset}",
+                               "visible": mesh.visible, "color": list(mesh.color),
+                               "opacity": mesh.opacity, "info": mesh.info})
 
             clip = self._clip_state()
             data = {
@@ -2197,10 +2484,21 @@ class MainWindow(QMainWindow):
                 },
                 "files": files,
                 "derived": derived,
+                "meshes": meshes,
+                "browser": {
+                    "current": self.entities.index(self.scene_panel.current_entity())
+                               if self.scene_panel.current_entity() in self.entities else -1,
+                    "compare": self.frame_browser.compare.isChecked(),
+                    "direction": self.frame_browser.direction.currentData(),
+                    "linked": self.frame_browser.linked.isChecked(),
+                },
             }
-            with open(path, "w", encoding="utf-8") as f:
+            temporary = path + ".tmp"
+            with open(temporary, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            self.log(f"工程已保存: {path}（{len(files)} 片源点云，{len(derived)} 片派生点云）")
+            os.replace(temporary, path)
+            self.log(f"工程已保存: {path}（{len(files)} 片源点云，{len(derived)} 片派生点云，{len(meshes)} 个网格）")
+            self._flash_status("工程已保存")
             return True
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "保存失败", str(exc))
@@ -2211,15 +2509,80 @@ class MainWindow(QMainWindow):
         if path:
             self.open_project(path)
 
-    def _export_current_dialog(self):
+    def _add_mesh(self, mesh):
+        if mesh not in self.meshes:
+            self.meshes.append(mesh)
+            self.viewport.add_mesh_entity(mesh)
+        self._update_status()
+
+    def _remove_mesh(self, mesh):
+        if mesh in self.meshes:
+            self.meshes.remove(mesh)
+            self.viewport.remove_mesh_entity(mesh)
+        self._update_status()
+
+    def _populate_mesh_menu(self):
+        self.mesh_menu.clear()
+        if not self.meshes:
+            self.mesh_menu.addAction("暂无网格结果").setEnabled(False)
+        for mesh in self.meshes:
+            menu = self.mesh_menu.addMenu(f"{mesh.name} · {mesh.triangle_count:,} 面")
+            visible = menu.addAction("显示")
+            visible.setCheckable(True)
+            visible.setChecked(mesh.visible)
+            visible.toggled.connect(lambda checked, m=mesh: self._set_mesh_visible(m, checked))
+            menu.addAction("导出 PLY…", lambda m=mesh: self._export_mesh(m))
+            menu.addAction("移除", lambda m=mesh: self._remove_mesh_with_history(m))
+
+    def _set_mesh_visible(self, mesh, visible):
+        if self._auto_mesh is mesh:
+            self._auto_mesh = None
+        mesh.visible = visible
+        self.viewport._refresh_meshes()
+        self.viewport._invalidate()
+
+    def _remove_mesh_with_history(self, mesh):
+        self._remove_mesh(mesh)
+        self.history.push(f"移除 {mesh.name}", lambda: self._add_mesh(mesh),
+                          lambda: self._remove_mesh(mesh))
+        self._update_history_buttons()
+
+    def _export_mesh(self, mesh):
+        path, _ = QFileDialog.getSaveFileName(self, "导出网格", mesh.name + ".ply", "PLY 网格 (*.ply)")
+        if path:
+            if not path.lower().endswith(".ply"):
+                path += ".ply"
+            try:
+                mesh_ops.write_mesh_ply(path, mesh.vertices, mesh.triangles)
+                self._flash_status("网格已导出")
+            except Exception as exc:
+                QMessageBox.warning(self, "导出失败", str(exc))
+
+    def _export_clipped_dialog(self):
+        self._export_current_dialog(clipped=True)
+
+    def _export_current_dialog(self, *, clipped=False):
         entity = self._current_entity()
         if entity is None:
             return
+        if clipped:
+            if self.viewport._clip_box is None:
+                self._flash_status("请先启用裁剪范围")
+                return
+            mn, mx = self.viewport._clip_box
+            keep = np.all((entity.xyz >= mn) & (entity.xyz <= mx), axis=1)
+            if not keep.any():
+                self._flash_status("当前点云在裁剪框内没有点")
+                return
+            entity = self._make_result(entity, "裁剪", entity.xyz[keep],
+                                       self._subset_fields(entity, keep), "裁剪内点云")
         default = os.path.splitext(entity.name)[0] + ".ply"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出当前点云", default,
-            "PLY 点云 (*.ply);;PCD 点云 (*.pcd);;XYZ 文本 (*.xyz)")
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "导出裁剪内点云" if clipped else "导出当前点云（完整数据）", default,
+            "PLY 点云 (*.ply);;PCD 点云 (*.pcd);;LAS 点云 (*.las);;PTS 点云 (*.pts);;XYZ 文本 (*.xyz)")
         if path:
+            if not os.path.splitext(path)[1]:
+                path += selected_filter.split("*", 1)[1].split(")", 1)[0]
             self.export_entity(entity, path)
 
     def export_entity(self, entity: CloudEntity, path: str) -> bool:
@@ -2243,6 +2606,9 @@ class MainWindow(QMainWindow):
             base = os.path.dirname(os.path.abspath(path))
             if data.get("theme"):
                 self._set_theme(data["theme"])
+            self._restoring_project = True
+            initial_count = len(self.entities)
+            restored_order = {}
 
             camera = data.get("camera")
             clip = data.get("clip")
@@ -2270,6 +2636,10 @@ class MainWindow(QMainWindow):
                 if existing is not None:
                     self._apply_pending(existing)
             self.open_paths([e["path"] for e in entries])
+            for index, entry in enumerate(entries):
+                entity = next((e for e in self.entities if e.path == entry["path"]), None)
+                if entity is not None:
+                    restored_order[entity] = entry.get("order", index)
 
             derived_failed = 0
             for entry in data.get("derived", []):
@@ -2286,6 +2656,7 @@ class MainWindow(QMainWindow):
                 entity = CloudEntity(name=entry.get("name") or os.path.basename(asset_path),
                                      path=None, xyz=xyz, fields=fields)
                 entity.visible = bool(entry.get("visible", True))
+                entity.visibility_pinned = bool(entry.get("visibility_pinned", entity.visible))
                 entity.color_mode = entry.get("color_mode", "auto")
                 entity.colormap = entry.get("colormap", "default")
                 entity.color_field = entry.get("color_field", "")
@@ -2293,23 +2664,63 @@ class MainWindow(QMainWindow):
                 entity.color_range = tuple(color_range) if color_range is not None else None
                 entity.point_size = float(entry.get("point_size", 2.0))
                 entity.info = entry.get("info", "工程内嵌派生点云")
+                entity.loaded = float(entry.get("loaded", 1.0))
+                entity.tier = entry.get("tier", tier_by_points(entity.point_count))
                 self._add_entity(entity)
+                restored_order[entity] = entry.get("order", len(entries) + len(restored_order))
 
+            for entry in data.get("meshes", []):
+                try:
+                    asset_path = os.path.abspath(os.path.join(base, entry["asset"]))
+                    with np.load(asset_path, allow_pickle=False) as asset:
+                        mesh = MeshEntity(entry.get("name", "网格"),
+                                          np.asarray(asset["vertices"], dtype=np.float32),
+                                          np.asarray(asset["triangles"], dtype=np.int32),
+                                          visible=bool(entry.get("visible", True)),
+                                          color=tuple(entry.get("color", (0.56, 0.66, 0.82))),
+                                          opacity=float(entry.get("opacity", 1)),
+                                          info=entry.get("info", ""))
+                    self._add_mesh(mesh)
+                except Exception as exc:
+                    derived_failed += 1
+                    self.log(f"网格恢复失败: {entry.get('name', '网格')} — {exc}")
+
+            browser = data.get("browser", {})
+            self.entities[initial_count:] = sorted(self.entities[initial_count:],
+                                                   key=lambda e: restored_order.get(e, len(self.entities)))
+            self.scene_panel.set_entities(self.entities)
+            current_order = int(browser.get("current", 0))
+            current = next((e for e, order in restored_order.items() if order == current_order), None)
+            if current is None and self.entities:
+                current = self.entities[min(initial_count, len(self.entities) - 1)]
+            if current is not None:
+                self.scene_panel.select_entity(current)
+            self._restoring_project = False
+            self.frame_browser.direction.setCurrentIndex(0 if browser.get("direction", 1) == 1 else 1)
+            self.frame_browser.linked.setChecked(browser.get("linked", True))
+            self.frame_browser.compare.setChecked(browser.get("compare", False))
             self._refresh_scene()
             self._show_entity(self.scene_panel.current_entity())
             # 首片点云加载会重置视角，工程相机必须在场景就绪后恢复。
             if isinstance(camera, dict):
                 self.viewport.set_camera_state(camera)
+                self._camera_initialized = True
+                self.frame_browser._sync_camera(self.viewport)
             if missing:
                 self.log("工程源文件缺失：\n" + "\n".join(missing))
+                self._flash_status(f"工程缺少 {len(missing)} 个源文件，请查看日志", 6000)
                 return False
             self.log(f"工程已打开: {path}")
             if derived_failed:
-                self.log(f"有 {derived_failed} 片派生点云未能恢复")
+                self.log(f"有 {derived_failed} 个派生数据未能恢复")
+                self._flash_status("部分工程数据未能恢复，请查看日志", 6000)
+                return False
             return True
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "打开失败", str(exc))
             return False
+        finally:
+            self._restoring_project = False
 
     # ================= 拖放 / 日志 / 关闭 =================
     def dragEnterEvent(self, event):
@@ -2328,7 +2739,7 @@ class MainWindow(QMainWindow):
             save_settings(self.settings)
         except Exception:  # noqa: BLE001
             pass
-        threads = list(self._threads.values())
+        threads = list(self._threads.values()) + self._scan_threads
         if self._filter_thread is not None:
             threads.append(self._filter_thread)
         if self._eps_thread is not None:
@@ -2344,10 +2755,15 @@ class MainWindow(QMainWindow):
                 self.setEnabled(False)
                 QTimer.singleShot(100, self.close)
                 return
-            self.log("后台任务未在 3 秒内响应取消，强制退出")
+            # 原生算法可能无法在一次计算中途取消，不能销毁仍运行的 QThread。
+            event.ignore()
+            self.status_task.setText("正在等待当前计算结束后关闭…")
+            QTimer.singleShot(200, self.close)
+            return
         self._close_deadline = None
         try:
             self.viewport.stop()
+            self.frame_browser.stop()
         except Exception:
             pass
         self._threads.clear()

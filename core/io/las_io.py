@@ -99,9 +99,8 @@ def read_las(path: str) -> CloudEntity:
     fields = {"intensity": ScalarField(
         "intensity", raw["intensity"].astype(np.float32), kind="scalar")}
     classification = raw["classification"]
-    if meta["point_format"] >= 6:
-        # 1.4：flags 字节高 4 位是分类标志，低 4 位并入 classification
-        classification = classification
+    if meta["point_format"] < 6:
+        classification = classification & 0x1F
     fields["classification"] = ScalarField(
         "classification", classification.astype(np.float32), kind="label")
     if "red" in raw.dtype.names:
@@ -119,13 +118,18 @@ def write_las(entity, path: str, *, scale: float = 0.001) -> None:
     xyz = np.asarray(entity.xyz, dtype=np.float64)
     if len(xyz) == 0:
         raise ValueError("空点云无法导出 LAS")
+    if not np.isfinite(xyz).all() or not np.isfinite(scale) or scale <= 0:
+        raise ValueError("LAS 导出需要有限坐标和正的坐标精度")
     has_rgb = "rgb" in entity.fields and np.asarray(entity.fields["rgb"].data).shape == (len(xyz), 3)
     point_format = 2 if has_rgb else 0
     record_length = 26 if has_rgb else 20
 
     origin = np.floor(xyz.min(axis=0)).astype(np.float64)
     scale_arr = np.array([scale, scale, scale], dtype=np.float64)
-    ints = np.round((xyz - origin) / scale_arr).astype(np.int32)
+    quantized = np.round((xyz - origin) / scale_arr)
+    if np.any(quantized > np.iinfo(np.int32).max):
+        raise ValueError("坐标范围超出毫米精度 LAS 的表示范围，请改用 PLY/PCD")
+    ints = quantized.astype(np.int32)
 
     intensity = entity.fields.get("intensity")
     if intensity is not None:
@@ -138,7 +142,10 @@ def write_las(entity, path: str, *, scale: float = 0.001) -> None:
 
     labels = entity.fields.get("classification") or entity.fields.get("labels")
     if labels is not None:
-        cls = np.clip(np.round(np.asarray(labels.data, dtype=np.float64)), 0, 255).astype("u1")
+        values = np.asarray(labels.data, dtype=np.float64)
+        if not np.isfinite(values).all() or np.any((values < 0) | (values > 31)):
+            raise ValueError("LAS 1.2 分类值需在 0–31 范围内；请改用 PLY/PCD 保留当前标签")
+        cls = np.round(values).astype("u1")
     else:
         cls = np.zeros(len(xyz), dtype="u1")
 
@@ -157,8 +164,7 @@ def write_las(entity, path: str, *, scale: float = 0.001) -> None:
     np.frombuffer(header, dtype="<f8", count=3, offset=155)[:] = origin
     # 包围盒（float64 位置 179..227）
     mins, maxs = xyz.min(axis=0), xyz.max(axis=0)
-    np.frombuffer(header, dtype="<f8", count=3, offset=179)[:] = maxs
-    np.frombuffer(header, dtype="<f8", count=3, offset=203)[:] = mins
+    np.frombuffer(header, dtype="<f8", count=6, offset=179)[:] = np.c_[maxs, mins].ravel()
 
     if has_rgb:
         rgb = np.asarray(entity.fields["rgb"].data, dtype=np.float64)
@@ -221,31 +227,38 @@ def read_e57(path: str) -> CloudEntity:
     _require("pye57", "读取 .e57 需要 pye57")
     import pye57
 
-    e57 = pye57.E57(path)
     parts: list[np.ndarray] = []
     intensity_parts: list[np.ndarray] = []
     color_parts: list[np.ndarray] = []
-    for i in range(int(e57.scan_count)):
-        data = e57.read_scan_raw(i)
-        pts = np.c_[data["cartesianX"], data["cartesianY"], data["cartesianZ"]].astype(np.float32)
-        parts.append(pts)
-        valid = np.isfinite(pts).all(axis=1)
-        if "intensity" in data:
-            intensity_parts.append(
-                np.where(valid, np.asarray(data["intensity"], dtype=np.float32), 0.0))
-        if {"colorRed", "colorGreen", "colorBlue"} <= set(data):
-            color_parts.append(np.c_[data["colorRed"], data["colorGreen"], data["colorBlue"]])
-    if not parts:
+    has_intensity = has_color = False
+    with pye57.E57(path) as e57:
+        for i in range(int(e57.scan_count)):
+            data = e57.read_scan(i, intensity=True, colors=True, transform=True,
+                                 ignore_missing_fields=True)
+            pts = np.c_[data["cartesianX"], data["cartesianY"], data["cartesianZ"]].astype(np.float32)
+            valid = np.isfinite(pts).all(axis=1)
+            parts.append(pts[valid])
+            intensity = np.zeros(len(pts), dtype=np.float32)
+            if "intensity" in data:
+                intensity = np.asarray(data["intensity"], dtype=np.float32)
+                has_intensity = True
+            intensity_parts.append(intensity[valid])
+            rgb = np.full((len(pts), 3), 0.6, dtype=np.float32)
+            if {"colorRed", "colorGreen", "colorBlue"} <= set(data):
+                # pye57 exposes E57 colors as uint8, including scans with a pose.
+                rgb = np.c_[data["colorRed"], data["colorGreen"], data["colorBlue"]].astype(np.float32) / 255.0
+                has_color = True
+            color_parts.append(rgb[valid])
+    if not parts or not any(len(part) for part in parts):
         raise ValueError("E57 中没有可读的点")
     xyz = np.concatenate(parts, axis=0)
     fields = {}
-    if intensity_parts:
+    if has_intensity:
         fields["intensity"] = ScalarField(
             "intensity", np.concatenate(intensity_parts).astype(np.float32), kind="scalar")
-    if color_parts:
+    if has_color:
         rgb = np.concatenate(color_parts).astype(np.float32)
-        scale = 65535.0 if rgb.max() > 1.5 else 1.0
-        fields["rgb"] = ScalarField("rgb", np.clip(rgb / scale, 0.0, 1.0), kind="color")
+        fields["rgb"] = ScalarField("rgb", np.clip(rgb, 0.0, 1.0), kind="color")
     entity = CloudEntity(name=os.path.basename(path), path=os.path.abspath(path), xyz=xyz,
                          fields=fields, dim_hint=3 + len(fields))
     entity.info = f"E57 · {len(xyz):,} 点 · {len(parts)} 扫描"

@@ -27,8 +27,8 @@ def _card(title: str):
     card = QWidget()
     card.setObjectName("overviewCard")
     lay = QVBoxLayout(card)
-    lay.setContentsMargins(14, 12, 14, 13)
-    lay.setSpacing(9)
+    lay.setContentsMargins(12, 10, 12, 10)
+    lay.setSpacing(7)
     head = QLabel(title)
     head.setObjectName("cardHead")
     lay.addWidget(head)
@@ -57,10 +57,11 @@ class OverviewPanel(QWidget):
         super().__init__(parent)
         self.setObjectName("inspector")
         self._entity = None
+        self._clip_statistics = {}
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(12)
+        root.setContentsMargins(10, 12, 10, 12)
+        root.setSpacing(10)
 
         title = QLabel("数据概览")
         title.setObjectName("sectionTitle")
@@ -84,8 +85,8 @@ class OverviewPanel(QWidget):
         badges.setSpacing(6)
         self.lbl_state = QLabel("—")
         self.lbl_state.setObjectName("badgePillDim")
-        badges.addWidget(self.lbl_state)
-        badges.addStretch(1)
+        self.lbl_state.setWordWrap(True)
+        badges.addWidget(self.lbl_state, 1)
         lay.addWidget(badge_row)
         root.addWidget(card)
 
@@ -133,9 +134,15 @@ class OverviewPanel(QWidget):
         root.addStretch(1)
 
     # ---------------- 数据接口 ----------------
-    def set_entity(self, entity: CloudEntity | None):
+    def set_clip_statistics(self, statistics):
+        self._clip_statistics = statistics
+        self.colorbar.title.setText("颜色条 · 原始数据" if statistics else "颜色条")
+        self.set_entity(self._entity, update_colorbar=False)
+
+    def set_entity(self, entity: CloudEntity | None, *, update_colorbar=True):
         self._entity = entity
-        self.colorbar.set_entity(entity)
+        if update_colorbar:
+            self.colorbar.set_entity(entity)
         if entity is None:
             self.lbl_name.setText("未选择点云")
             self.lbl_points.setText("—")
@@ -148,9 +155,23 @@ class OverviewPanel(QWidget):
 
         self.lbl_name.setText(entity.name)
         self.lbl_points.setText(f"{entity.point_count:,}")
-        self.lbl_state.setText("预览加载中" if entity.is_preview else "已就绪")
+        if entity.is_preview:
+            state = "预览加载中" if entity.load_state == "loading" else f"预览数据 · {entity.loaded:.0%}"
+        else:
+            state = "已就绪"
+        self.lbl_state.setText(state)
+        if entity.xyz is None:
+            self.lbl_points.setText("—")
+            self.lbl_state.setText({"unloaded": "待浏览", "loading": "正在加载…",
+                                   "error": "加载失败，请右键重新加载"}.get(entity.load_state, "空点云"))
 
-        b = entity.bounds()
+        clipped = self._clip_statistics.get(id(entity))
+        b = entity.bounds() if clipped is None else clipped[1]
+        if clipped is not None:
+            count, b = clipped
+            self.lbl_points.setText(f"{count:,}")
+            self.lbl_state.setText(f"裁剪后 · 原始 {entity.point_count:,} 点" +
+                                   (" · 预览数据" if entity.is_preview else ""))
         if b is not None:
             mn, mx = b
             self.v_x.setText(f"{mn[0]:.2f}  →  {mx[0]:.2f}  m")
@@ -158,7 +179,7 @@ class OverviewPanel(QWidget):
             self.v_z.setText(f"{mn[2]:.2f}  →  {mx[2]:.2f}  m")
             d = mx - mn
             self.v_size.setText(f"{d[0]:.2f} × {d[1]:.2f} × {d[2]:.2f}  m")
-            self.v_diag.setText(f"{entity.extent():.2f}  m")
+            self.v_diag.setText(f"{float(sum(d ** 2) ** 0.5):.2f}  m")
         else:
             for value in (self.v_x, self.v_y, self.v_z, self.v_size, self.v_diag):
                 value.setText("—")
@@ -172,7 +193,7 @@ class OverviewPanel(QWidget):
 
     def set_loading_progress(self, entity: CloudEntity, fraction: float):
         if self._entity is entity:
-            self.lbl_state.setText(f"预览加载中 {int(fraction * 100)}%")
+            self.lbl_state.setText(f"正在加载 {int(fraction * 100)}%")
 
     def set_scene_stats(self, count: int, points: int, mem_bytes: int):
         self.v_scene.setText(f"{count} 片 · {points:,} 点")

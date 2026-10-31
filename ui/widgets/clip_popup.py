@@ -39,7 +39,7 @@ class ClipPopup(QWidget):
         head.addWidget(self.chk_enable)
         root.addLayout(head)
 
-        hint = QLabel("超出范围的点的显示会被裁掉；橙色线框表示当前范围。")
+        hint = QLabel("拖动橙色手柄调整范围，Esc 取消拖动。此处只改变显示；要保存框内点，请选择「工程 → 导出裁剪内点云」。")
         hint.setObjectName("dim")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -51,7 +51,7 @@ class ClipPopup(QWidget):
             for col, suffix in enumerate(("min", "max")):
                 spin = QDoubleSpinBox()
                 spin.setRange(-1e9, 1e9)
-                spin.setDecimals(2)
+                spin.setDecimals(4)
                 spin.setMinimumWidth(88)
                 label = QLabel(f"{axis} {suffix}")
                 label.setObjectName("dim")
@@ -135,6 +135,8 @@ class ClipPopup(QWidget):
         return all(lo < hi for lo, hi in zip(mn, mx))
 
     def set_values(self, mn, mx):
+        self._timer.stop()
+        self.lbl_warning.hide()
         values = {
             "X min": mn[0], "X max": mx[0],
             "Y min": mn[1], "Y max": mx[1],

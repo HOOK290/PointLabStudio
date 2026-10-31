@@ -5,10 +5,10 @@ from __future__ import annotations
 import numpy as np
 
 
-def estimate_normals(xyz: np.ndarray, k: int = 20) -> np.ndarray:
+def estimate_normals(xyz: np.ndarray, k: int = 20, progress=None, cancel=None) -> np.ndarray:
     """k 近邻 PCA 法线，按“背离质心”统一朝向。"""
     from core.algorithms.registration import estimate_normals as _est
-    return _est(xyz, k=k)
+    return _est(xyz, k=k, progress=progress, cancel=cancel)
 
 
 def c2c_distance(source: np.ndarray, target: np.ndarray) -> np.ndarray:

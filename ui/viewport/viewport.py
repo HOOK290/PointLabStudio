@@ -1,8 +1,8 @@
 """3D 视口：pygfx（wgpu GPU 渲染）嵌入 Qt。
 
 - 任意规模点云同一个视口展示（Auto-Ingest 分级在 core 层完成）
-- 保留 vis_point_cloud.py 的键盘习惯：R/C/+/-/WASD/QE/←→
-- 背景渐变（深/浅主题）、坐标轴、地面网格、裁剪盒（CPU 掩码初版）
+- 键盘控制：R/C/+/-/WASD/QE/←→
+- 背景渐变（深/浅主题）、坐标轴、地面网格、GPU 裁剪盒
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import time
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import QEvent, QPointF, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
 from rendercanvas.qt import RenderCanvas
@@ -73,7 +73,8 @@ class _SelectionRubber(QWidget):
         kind, data = self._shape
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        pen = QPen(QColor(96, 176, 255, 235), 1.4)
+        color = QColor("#005FCC") if self.parent().theme == "light" else QColor(96, 176, 255, 235)
+        pen = QPen(color, 1.4)
         if kind == "box":
             pen.setStyle(Qt.DashLine)
         painter.setPen(pen)
@@ -100,6 +101,12 @@ class PointCloudViewport(RenderCanvas):
     measured = Signal(float)          # 两点距离（米）
     mode_changed = Signal(str)        # "" / "measure" / "select" / "box" / "lasso"
     selection_changed = Signal(object)  # [(entity, np.ndarray indices), ...]；[] 表示清空
+    navigation_changed = Signal(bool)
+    camera_changed = Signal()
+    clip_drag_started = Signal()
+    clip_dragged = Signal(object, object)
+    clip_drag_finished = Signal()
+    clip_statistics_changed = Signal(object)
 
     def __init__(self, theme: str = "dark"):
         super().__init__(max_fps=120)
@@ -116,6 +123,9 @@ class PointCloudViewport(RenderCanvas):
         # CloudCompare 风格转盘相机：左键旋转（绕 Z 轴 yaw + 俯仰）、右键/中键平移、滚轮缩放、
         # 双击把旋转中心设为鼠标下的点。自己维护球坐标，避免 OrbitController 绕原点旋转。
         self.controller = None
+        self._fixed_view = False
+        self._walk_remaining = 0.0
+        self._walk_velocity = 0.0
         self._pivot = np.zeros(3, dtype=np.float64)
         self._yaw = np.deg2rad(-90.0)
         self._pitch = np.deg2rad(24.0)
@@ -143,8 +153,17 @@ class PointCloudViewport(RenderCanvas):
         self._axis_obj = None
         self._axis_group = None
         self._clip_lines = None
+        self._clip_handles = None
+        self._clip_drag = None
+        self._clip_drag_perspective = 0.0
+        self._clip_stats_job = None
+        self._clip_stats_timer = QTimer(self)
+        self._clip_stats_timer.setInterval(1)
+        self._clip_stats_timer.timeout.connect(self._step_clip_statistics)
         self._grid_obj = None
         self._grid_theme = None
+        self._grid_base_size = 1.0
+        self._grid_divisions = None
         self._background = None
         self._apply_background()
 
@@ -240,6 +259,8 @@ class PointCloudViewport(RenderCanvas):
     def stop(self):
         """停止渲染循环（关闭前调用，避免画布销毁后 wgpu 回调仍触发）。"""
         self._running = False
+        self._clip_stats_timer.stop()
+        self._clip_stats_job = None
 
     def _animate(self):
         if not self._running:
@@ -248,6 +269,7 @@ class PointCloudViewport(RenderCanvas):
         dt = min(max(now - self._last_frame_time, 0.0), 0.1)
         self._last_frame_time = now
         self._step_zoom_animation(dt)
+        self._step_walk_animation(dt)
         if self._needs_draw:
             self._needs_draw = False
             try:
@@ -271,6 +293,9 @@ class PointCloudViewport(RenderCanvas):
         if self.theme == "light":
             return "#EDEDF0", "#D8D8DD", "#B9B9C0"
         return "#101016", "#050507", "#5A5A66"
+
+    def _tool_color(self):
+        return "#A65300" if self.theme == "light" else (1.0, 0.72, 0.25, 1.0)
 
     def _apply_background(self):
         top, bottom, _ = self._theme_colors()
@@ -340,7 +365,8 @@ class PointCloudViewport(RenderCanvas):
         if hasattr(gfx, "GridHelper"):
             grid_size = size * 1.6
             divisions = max(10, min(80, int(grid_size / 10)))
-            if self._grid_obj is not None and self._grid_theme != self.theme:
+            if self._grid_obj is not None and (
+                    self._grid_theme != self.theme or self._grid_divisions != divisions):
                 try:
                     self.scene.remove(self._grid_obj)
                 except Exception:
@@ -356,14 +382,16 @@ class PointCloudViewport(RenderCanvas):
                     self._grid_obj.local.rotation = (0.70710678, 0.0, 0.0, 0.70710678)
                     self._grid_obj.visible = self._grid_visible
                     self._grid_theme = self.theme
+                    self._grid_base_size = grid_size
+                    self._grid_divisions = divisions
                     self.scene.add(self._grid_obj)
                 except Exception:
                     self._grid_obj = None
 
             if self._grid_obj is not None:
                 try:
-                    self._grid_obj.size = grid_size
-                    self._grid_obj.divisions = divisions
+                    scale = grid_size / self._grid_base_size
+                    self._grid_obj.local.scale = (scale, scale, scale)
                 except Exception:
                     pass
                 if bounds is not None:
@@ -379,7 +407,9 @@ class PointCloudViewport(RenderCanvas):
         total = 0.0
         for e in self.entities:
             if e.visible and e.xyz is not None and len(e.xyz):
-                total = max(total, e.extent())
+                metrics = self._lod_metrics.get(id(e))
+                extent = metrics[2] if metrics is not None and metrics[0] is e.xyz else e.extent()
+                total = max(total, extent)
         return total
 
     def _scene_bounds(self):
@@ -398,12 +428,16 @@ class PointCloudViewport(RenderCanvas):
     # ---------------- 数据刷新 ----------------
     def set_entities(self, entities: list):
         self.entities = list(entities)
+        self._proj_cache.clear()
         self.refresh()
 
     def set_theme(self, theme: str):
         self.theme = theme
         self._apply_background()
         self._ensure_helpers()
+        self._update_clip_lines()
+        if self._measure_pts:
+            self._draw_measurement_polyline()
         self.refresh()
 
     def set_clip_box(self, mn, mx):
@@ -415,15 +449,153 @@ class PointCloudViewport(RenderCanvas):
         self._clip_box = (np.asarray(mn, dtype=np.float32), np.asarray(mx, dtype=np.float32)) \
             if mn is not None and mx is not None else None
         self._update_clip_lines()
-        self.refresh()
+        self._apply_clip_planes()
+        self.clear_selection()
+        self._needs_draw = True
+        if self._clip_drag is None:
+            self._schedule_clip_statistics()
         return True
 
+    def _clip_planes(self):
+        if self._clip_box is None:
+            return []
+        mn, mx = self._clip_box
+        return [(1, 0, 0, float(mn[0])), (-1, 0, 0, float(-mx[0])),
+                (0, 1, 0, float(mn[1])), (0, -1, 0, float(-mx[1])),
+                (0, 0, 1, float(mn[2])), (0, 0, -1, float(-mx[2]))]
+
+    def _apply_clip_planes(self):
+        planes = self._clip_planes()
+        for obj in self._points_objs:
+            obj.material.clipping_planes = planes
+
+    def _schedule_clip_statistics(self):
+        self._clip_stats_timer.stop()
+        self._clip_stats_job = None
+        if self._clip_box is None:
+            self.clip_statistics_changed.emit({})
+            return
+        bounds = tuple(a.copy() for a in self._clip_box)
+        entities = [(id(e), e.xyz) for e in self.entities if e.xyz is not None]
+
+        def scan():
+            result = {}
+            for key, xyz in entities:
+                count, low, high = 0, None, None
+                for start in range(0, len(xyz), 100_000):
+                    chunk = xyz[start:start + 100_000]
+                    selected = chunk[np.all((chunk >= bounds[0]) & (chunk <= bounds[1]), axis=1)]
+                    count += len(selected)
+                    if len(selected):
+                        lo, hi = selected.min(axis=0), selected.max(axis=0)
+                        low = lo if low is None else np.minimum(low, lo)
+                        high = hi if high is None else np.maximum(high, hi)
+                    yield
+                result[key] = (count, None if low is None else (low, high))
+            self.clip_statistics_changed.emit(result)
+
+        self._clip_stats_job = scan()
+        self._clip_stats_timer.start()
+
+    def _step_clip_statistics(self):
+        deadline = time.monotonic() + 0.006
+        while self._clip_stats_job is not None and time.monotonic() < deadline:
+            try:
+                next(self._clip_stats_job)
+            except StopIteration:
+                self._clip_stats_job = None
+                self._clip_stats_timer.stop()
+
     def clear_clip_box(self):
+        self._finish_clip_drag()
         self.set_clip_box(None, None)
+
+    def _clip_face_centers(self):
+        mn, mx = self._clip_box
+        centers = np.tile((mn.astype(float) + mx) / 2, (6, 1))
+        for axis in range(3):
+            centers[axis * 2, axis] = mn[axis]
+            centers[axis * 2 + 1, axis] = mx[axis]
+        return centers
+
+    def _clip_handle_screen(self):
+        points = self._clip_face_centers()
+        matrix = np.asarray(self.camera.projection_matrix) @ np.asarray(self.camera.view_matrix)
+        clip = np.column_stack((points, np.ones(6))) @ matrix.T
+        valid = (clip[:, 3] > 1e-9)
+        ndc = clip[:, :3] / np.where(valid, clip[:, 3], 1)[:, None]
+        valid &= (ndc[:, 2] >= 0) & (ndc[:, 2] <= 1)
+        screen = np.column_stack(((ndc[:, 0] + 1) * self.width() / 2,
+                                  (1 - ndc[:, 1]) * self.height() / 2))
+        return points, screen, valid
+
+    def _begin_clip_drag(self, x, y):
+        if self._clip_box is None:
+            return False
+        points, screen, valid = self._clip_handle_screen()
+        distances = np.linalg.norm(screen - (x, y), axis=1)
+        distances[~valid] = np.inf
+        index = int(np.argmin(distances))
+        if distances[index] > 12:
+            return False
+        axis = index // 2
+        point = points[index]
+        matrix = np.asarray(self.camera.projection_matrix) @ np.asarray(self.camera.view_matrix)
+        clip = matrix @ np.append(point, 1)
+        # 投影的轴向导数；视线正对该轴时无法可靠拖动，需先旋转视图。
+        derivative = (matrix[:2, axis] * clip[3] - clip[:2] * matrix[3, axis]) / clip[3] ** 2
+        direction = derivative * (self.width() / 2, -self.height() / 2)
+        if np.linalg.norm(direction) * max(self._scene_extent(), 1) < 2:
+            return False
+        self._sync_zoom()
+        self._clip_stats_timer.stop()
+        self._clip_stats_job = None
+        self._clip_drag_perspective = float(matrix[3, axis] / clip[3])
+        self._clip_drag = (index, np.array([x, y]), direction,
+                           tuple(a.copy() for a in self._clip_box))
+        self._drag = None
+        self.clip_drag_started.emit()
+        self.setCursor(Qt.SizeAllCursor)
+        return True
+
+    def _move_clip_drag(self, x, y):
+        index, start, direction, bounds = self._clip_drag
+        axis, side = divmod(index, 2)
+        delta = float(np.dot(np.array([x, y]) - start, direction) / np.dot(direction, direction))
+        # 反解透视投影，而不是把屏幕位移当作固定世界距离。
+        denominator = 1.0 - delta * self._clip_drag_perspective
+        if denominator <= 1e-6:
+            return
+        delta /= denominator
+        mn, mx = (a.copy() for a in bounds)
+        value = bounds[side][axis] + delta
+        if side == 0:
+            mn[axis] = min(value, np.nextafter(mx[axis], np.float32(-np.inf)))
+        else:
+            mx[axis] = max(value, np.nextafter(mn[axis], np.float32(np.inf)))
+        if self.set_clip_box(mn, mx):
+            self.clip_dragged.emit(mn, mx)
+
+    def _finish_clip_drag(self):
+        if self._clip_drag is not None:
+            self._clip_drag = None
+            self.setCursor(Qt.ArrowCursor)
+            self._schedule_clip_statistics()
+            self.clip_drag_finished.emit()
+
+    def cancel_clip_drag(self):
+        if self._clip_drag is not None:
+            mn, mx = self._clip_drag[3]
+            self.set_clip_box(mn, mx)
+            self.clip_dragged.emit(mn, mx)
+            self._finish_clip_drag()
 
     def _update_clip_lines(self):
         """裁剪范围线框可视化（12 条棱边），实时反映输入的范围。"""
-        if self._clip_lines is not None:
+        if self._clip_box is None and self._clip_handles is not None:
+            self.scene.remove(self._clip_handles)
+            self._clip_handles = None
+        if self._clip_box is None and self._clip_lines is not None:
             try:
                 self.scene.remove(self._clip_lines)
             except Exception:
@@ -450,23 +622,34 @@ class PointCloudViewport(RenderCanvas):
                 seg.append(corners[a])
                 seg.append(corners[b])
             positions = np.array(seg, dtype=np.float32)
+            if self._clip_lines is not None and self._clip_handles is not None:
+                self._clip_lines.material.color = self._tool_color()
+                self._clip_handles.material.color = self._tool_color()
+                self._clip_lines.geometry.positions.data[:] = positions
+                self._clip_lines.geometry.positions.update_full()
+                self._clip_handles.geometry.positions.data[:] = self._clip_face_centers()
+                self._clip_handles.geometry.positions.update_full()
+                return
             line = gfx.Line(
                 gfx.Geometry(positions=positions),
-                gfx.LineMaterial(thickness=2, color=(1.0, 0.72, 0.25, 1.0)),
+                gfx.LineSegmentMaterial(thickness=2, color=self._tool_color()),
             )
             self._clip_lines = line
             self.scene.add(line)
+            self._clip_handles = gfx.Points(
+                gfx.Geometry(positions=self._clip_face_centers().astype(np.float32)),
+                gfx.PointsMaterial(size=12, size_space="screen",
+                                   color=self._tool_color(), depth_test=False))
+            self._clip_handles.render_order = 20
+            self.scene.add(self._clip_handles)
         except Exception:
             self._clip_lines = None
 
     def _entity_signature(self, entity):
-        clip = None
-        if self._clip_box is not None:
-            clip = tuple(np.asarray(self._clip_box[0], dtype=np.float64).tolist()) + tuple(
-                np.asarray(self._clip_box[1], dtype=np.float64).tolist())
         fields = tuple((name, id(field.data)) for name, field in entity.fields.items())
         return (id(entity.xyz), entity.color_mode, entity.colormap,
-                entity.color_field, entity.color_range, clip, fields,
+                entity.color_field, entity.color_range, fields,
+                self.theme if entity.color_mode == "none" else None,
                 self._lod_budget_for(entity))
 
     def _lod_budget_for(self, entity) -> int:
@@ -481,7 +664,7 @@ class PointCloudViewport(RenderCanvas):
         return lod.lod_budget(entity.point_count, extent, distance)
 
     def _build_points(self, entity):
-        """为一个实体创建 gfx.Points；不可见（被裁剪干净）时返回 None。"""
+        """创建可复用的点云缓冲；裁剪由材质的世界坐标平面完成。"""
         xyz = entity.xyz
         colors = compute_colors(entity)
         budget = self._lod_budget_for(entity)
@@ -491,18 +674,11 @@ class PointCloudViewport(RenderCanvas):
             xyz = xyz[sample]
             colors = colors[sample] if colors is not None else None
         self._lod_counts[id(entity)] = int(len(xyz))
-        if self._clip_box is not None:
-            mn, mx = self._clip_box
-            mask = np.all((xyz >= mn) & (xyz <= mx), axis=1)
-            if not mask.any():
-                return None
-            xyz = xyz[mask]
-            colors = colors[mask] if colors is not None else None
         rgba = np.empty((len(xyz), 4), dtype=np.float32)
         if colors is not None:
             rgba[:, :3] = colors
         else:
-            rgba[:, :3] = (0.85, 0.85, 0.88)
+            rgba[:, :3] = (0.22, 0.25, 0.30) if self.theme == "light" else (0.85, 0.85, 0.88)
         rgba[:, 3] = 1.0
         try:
             geo = gfx.Geometry(positions=xyz, colors=rgba)
@@ -511,6 +687,7 @@ class PointCloudViewport(RenderCanvas):
                 size_space="screen",
                 color_mode="vertex",
                 opacity=1.0,
+                clipping_planes=self._clip_planes(),
             )
             return gfx.Points(geo, mat)
         except Exception as exc:  # noqa: BLE001
@@ -540,7 +717,7 @@ class PointCloudViewport(RenderCanvas):
             self.refresh(lod_only=True)
 
     def refresh(self, *, lod_only=False):
-        """增量同步实体：颜色键/裁剪盒不变时复用已有 GPU 对象。"""
+        """增量同步实体：数据、颜色与 LOD 不变时复用已有 GPU 对象。"""
         self._needs_draw = True
         if not lod_only:
             self.clear_selection()
@@ -596,6 +773,8 @@ class PointCloudViewport(RenderCanvas):
         self._ensure_helpers()
         self._set_empty_visible(not visible_any)
         self._center_empty_label()
+
+        self._schedule_clip_statistics()
 
     # ---------------- 网格实体 ----------------
     def add_mesh_entity(self, mesh):
@@ -669,17 +848,51 @@ class PointCloudViewport(RenderCanvas):
             -np.sin(self._yaw) * np.sin(self._pitch), ce)
         self.camera.look_at(self._pivot)
         self._needs_draw = True
+        self.camera_changed.emit()
 
     def orbit_camera(self, dx: float, dy: float):
         """左键拖拽：水平绕世界 Z 轴、垂直连续旋转完整一周。"""
+        position = np.array(self.camera.local.position, copy=True)
         speed = ORBIT_SPEED
         mods = QApplication.keyboardModifiers() if QApplication.instance() else Qt.NoModifier
         if mods & Qt.ShiftModifier:
             speed *= 0.25  # 按住 Shift 精调
         self._yaw = float((self._yaw - float(dx) * speed + np.pi) % (2.0 * np.pi) - np.pi)
-        self._pitch = float((self._pitch - float(dy) * speed + np.pi)
-                            % (2.0 * np.pi) - np.pi)
+        if not self._fixed_view:
+            self._pitch = float((self._pitch - float(dy) * speed + np.pi)
+                                % (2.0 * np.pi) - np.pi)
         self._apply_camera()
+        if self._fixed_view:
+            self._pivot += position - np.asarray(self.camera.local.position)
+            self._apply_camera()
+
+    def set_fixed_view(self, enabled: bool):
+        self._sync_zoom()
+        self._fixed_view = bool(enabled)
+        self.navigation_changed.emit(self._fixed_view)
+
+    def _walk_direction(self):
+        sign = 1.0 if np.cos(self._pitch) >= 0 else -1.0
+        return -sign * np.array([np.cos(self._yaw), np.sin(self._yaw), 0.0])
+
+    def _step_walk_animation(self, dt):
+        if not self._fixed_view or (self._walk_remaining == 0 and self._walk_velocity == 0):
+            return
+        error, velocity = self._walk_remaining, self._walk_velocity
+        omega = 18.0
+        decay = float(np.exp(-omega * dt))
+        impulse = (velocity + omega * error) * dt
+        remaining = (error + impulse) * decay
+        self._walk_velocity = (velocity - omega * impulse) * decay
+        tolerance = max(self._pan_step() * 1e-5, 1e-9)
+        if abs(remaining) < tolerance and abs(self._walk_velocity) < tolerance:
+            remaining = 0.0
+            self._walk_velocity = 0.0
+        self._walk_remaining = remaining
+        self._pivot += self._walk_direction() * (error - remaining)
+        self._apply_camera()
+        if remaining == 0:
+            self._update_lod()
 
     def _pan_pixels(self, dx: float, dy: float):
         view = np.asarray(self.camera.view_matrix, dtype=np.float64)
@@ -688,12 +901,17 @@ class PointCloudViewport(RenderCanvas):
         up = rot[:, 1]
         step = max(self._distance, 1e-6) * 0.0016
         delta = (-float(dx) * right + float(dy) * up) * step
+        if self._fixed_view:
+            delta[2] = 0
         self._pivot = self._pivot + delta
         self._apply_camera()
 
     def zoom_camera(self, notches: float):
         """滚轮缩放：只更新目标距离，真正的距离由渲染循环阻尼逼近。"""
         if not np.isfinite(notches) or abs(notches) < 1e-9:
+            return
+        if self._fixed_view:
+            self._walk_remaining += float(np.clip(notches, -100, 100)) * self._pan_step() * 5
             return
         base = self._zoom_target if self._zoom_animating else self._distance
         target_log = np.log(base) + np.log(ZOOM_STEP) * float(notches)
@@ -743,6 +961,8 @@ class PointCloudViewport(RenderCanvas):
         self._zoom_velocity = 0.0
         self._zoom_animating = False
         self._zoom_lod_pending = False
+        self._walk_remaining = 0.0
+        self._walk_velocity = 0.0
 
     def _set_pivot(self, point):
         point = np.asarray(point, dtype=np.float64)
@@ -792,6 +1012,7 @@ class PointCloudViewport(RenderCanvas):
             "yaw": float(self._yaw),
             "pitch": float(self._pitch),
             "fov": float(self.camera.fov),
+            "fixed_view": self._fixed_view,
         }
 
     def set_camera_state(self, state: dict) -> bool:
@@ -812,6 +1033,7 @@ class PointCloudViewport(RenderCanvas):
                 np.clip(offset[2] / self._distance, -1.0, 1.0))))
             self._yaw = float(state.get("yaw", np.arctan2(offset[1], offset[0])))
             self._sync_zoom()
+            self.set_fixed_view(state.get("fixed_view", False))
             self._needs_draw = True
             return True
         except Exception:  # noqa: BLE001
@@ -835,6 +1057,9 @@ class PointCloudViewport(RenderCanvas):
 
             step = self._pan_step()
             delta = (dx * right + dy * upv + dz * forward) * step
+            if self._fixed_view:
+                delta = (dx * right + dy * upv + dz * self._walk_direction()) * step
+                delta[2] = 0
             self._pivot = target + delta
             self.camera.local.position = pos + delta
             self._needs_draw = True
@@ -926,7 +1151,8 @@ class PointCloudViewport(RenderCanvas):
         obj = gfx.Points(
             gfx.Geometry(positions=xyz),
             gfx.PointsMaterial(size=size, size_space="screen",
-                               color=(1.0, 0.56, 0.10, 1.0), depth_test=False),
+                               color=self._tool_color() if self.theme == "light" else (1.0, 0.56, 0.10, 1.0),
+                               depth_test=False),
         )
         obj.render_order = 15
         self.scene.add(obj)
@@ -1099,7 +1325,7 @@ class PointCloudViewport(RenderCanvas):
             outline = np.vstack([pts, pts[:1]]) if len(pts) >= 3 else pts
             line = gfx.Line(
                 gfx.Geometry(positions=outline),
-                gfx.LineMaterial(thickness=3, color=(1.0, 0.72, 0.25, 1.0)),
+                gfx.LineMaterial(thickness=3, color=self._tool_color()),
             )
             self.scene.add(line)
             self._measure_objs.append(line)
@@ -1123,7 +1349,7 @@ class PointCloudViewport(RenderCanvas):
     def _point_marker(self, position):
         marker = gfx.Points(
             gfx.Geometry(positions=np.asarray(position, dtype=np.float32).reshape(1, 3)),
-            gfx.PointsMaterial(size=10, size_space="screen", color=(1.0, 0.72, 0.25, 1.0),
+            gfx.PointsMaterial(size=10, size_space="screen", color=self._tool_color(),
                                depth_test=False),
         )
         marker.render_order = 20
@@ -1270,6 +1496,8 @@ class PointCloudViewport(RenderCanvas):
             return
         pos = event.position()
         if event.button() == Qt.LeftButton:
+            if self._begin_clip_drag(float(pos.x()), float(pos.y())):
+                return
             self._drag = ("orbit", float(pos.x()), float(pos.y()))
             return
         if event.button() in (Qt.RightButton, Qt.MiddleButton):
@@ -1280,6 +1508,9 @@ class PointCloudViewport(RenderCanvas):
     def mouseMoveEvent(self, event):
         pos = event.position()
         x, y = float(pos.x()), float(pos.y())
+        if self._clip_drag is not None:
+            self._move_clip_drag(x, y)
+            return
         if self._sel_dragging:
             x0, y0 = self._sel_start
             self._sel_rubber.set_shape(("box", (x0, y0, x, y)))
@@ -1296,6 +1527,11 @@ class PointCloudViewport(RenderCanvas):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._clip_drag is not None and event.button() == Qt.LeftButton:
+            self._move_clip_drag(event.position().x(), event.position().y())
+            self._finish_clip_drag()
+            self._update_lod()
+            return
         if self._sel_dragging:
             self._sel_dragging = False
             pos = event.position()
@@ -1318,7 +1554,7 @@ class PointCloudViewport(RenderCanvas):
         self._update_lod()
 
     def mouseDoubleClickEvent(self, event):
-        if self._mode is not None:
+        if self._mode is not None or self._fixed_view or self._clip_drag is not None:
             super().mouseDoubleClickEvent(event)
             return
         pos = event.position()
@@ -1336,6 +1572,9 @@ class PointCloudViewport(RenderCanvas):
         self._update_lod()
 
     def wheelEvent(self, event):
+        if self._clip_drag is not None:
+            event.accept()
+            return
         pixels = event.pixelDelta().y()
         notches = pixels / 50.0 if pixels else event.angleDelta().y() / 120.0
         self.zoom_camera(notches)
@@ -1350,6 +1589,11 @@ class PointCloudViewport(RenderCanvas):
 
     def keyPressEvent(self, event):
         key = event.key()
+        if self._clip_drag is not None:
+            if key == Qt.Key_Escape:
+                self.cancel_clip_drag()
+            event.accept()
+            return
         if key == Qt.Key_Escape:
             if self._mode is not None:
                 self.set_interaction_mode(None)

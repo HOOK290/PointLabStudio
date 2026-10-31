@@ -86,13 +86,18 @@ def icp(source: np.ndarray, target: np.ndarray, max_iterations: int = 30,
         if it > 2 and abs(prev_rmse - rmse) < 1e-7:
             break
         prev_rmse = rmse
-        if np.linalg.norm(translation) < tolerance and it > 3:
+        if (np.linalg.norm(translation) < tolerance
+                and np.linalg.norm(rotation - np.eye(3)) < tolerance and it > 3):
             break
 
+    dist, _ = tree.query(apply_transform(src, transform), workers=-1)
+    keep = dist <= np.quantile(dist, trim_ratio) if trim_ratio < 1.0 else np.ones(len(dist), bool)
+    rmse = float(np.sqrt(np.mean(dist[keep] ** 2)))
     return transform, rmse
 
 
-def estimate_normals(xyz: np.ndarray, k: int = 20) -> np.ndarray:
+def estimate_normals(xyz: np.ndarray, k: int = 20,
+                     progress: ProgressCb = None, cancel: CancelCb = None) -> np.ndarray:
     """用 k 近邻 PCA 估计法线，按“背离点云质心”统一朝向（适合单视角扫描）。"""
     from scipy.spatial import cKDTree
 
@@ -101,18 +106,23 @@ def estimate_normals(xyz: np.ndarray, k: int = 20) -> np.ndarray:
         raise ValueError("点云点数太少，无法估计法线")
     k = int(min(max(3, k), len(xyz)))
     tree = cKDTree(xyz)
-    _, idx = tree.query(xyz, k=k, workers=-1)
-    neigh = xyz[idx]                      # (N, k, 3)
-    centred = neigh - neigh.mean(axis=1, keepdims=True)
-    cov = np.einsum("nki,nkj->nij", centred, centred) / k
-    _, vecs = np.linalg.eigh(cov)         # 升序：最小特征值对应法线
-    normals = vecs[:, :, 0]
-    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
-    normals = normals / np.maximum(lengths, 1e-12)
-    outward = xyz - xyz.mean(axis=0)
-    flip = np.einsum("ij,ij->i", normals, outward) < 0
-    normals[flip] *= -1.0
-    return normals.astype(np.float32)
+    normals = np.empty_like(xyz, dtype=np.float32)
+    center = xyz.mean(axis=0)
+    for start in range(0, len(xyz), 20_000):
+        check_cancel(cancel)
+        points = xyz[start:start + 20_000]
+        _, idx = tree.query(points, k=k, workers=-1)
+        neighbors = xyz[idx]
+        centered = neighbors - neighbors.mean(axis=1, keepdims=True)
+        cov = np.einsum("nki,nkj->nij", centered, centered) / k
+        _, vectors = np.linalg.eigh(cov)
+        normal = vectors[:, :, 0]
+        flip = np.einsum("ij,ij->i", normal, points - center) < 0
+        normal[flip] *= -1.0
+        normals[start:start + len(points)] = normal
+        if progress is not None:
+            progress((start + len(points)) / len(xyz))
+    return normals
 
 
 def icp_point_to_plane(source: np.ndarray, target: np.ndarray,
@@ -121,7 +131,8 @@ def icp_point_to_plane(source: np.ndarray, target: np.ndarray,
                        max_corr_distance: float = 1.0, sample_limit: int = 80_000,
                        trim_ratio: float = 0.9, seed: int = 0,
                        progress: ProgressCb = None,
-                       cancel: CancelCb = None) -> Tuple[np.ndarray, float]:
+                       cancel: CancelCb = None,
+                       initial_transform: np.ndarray | None = None) -> Tuple[np.ndarray, float]:
     """点到面 ICP：最小化 n·(R·p + t - q) 的平方和。
 
     比点对点 ICP 收敛更快、对平面/墙面场景更稳。target_normals 为空时自动估计。
@@ -133,20 +144,28 @@ def icp_point_to_plane(source: np.ndarray, target: np.ndarray,
     if len(source) < 10 or len(target) < 10:
         raise ValueError("点云点数太少，无法配准")
 
-    if target_normals is None:
-        target_normals = estimate_normals(target)
-    target_normals = np.asarray(target_normals, dtype=np.float64)
-
     rng = np.random.default_rng(seed)
     src = source if len(source) <= sample_limit else source[
         rng.choice(len(source), sample_limit, replace=False)]
-    tgt = target if len(target) <= sample_limit else target[
-        rng.choice(len(target), sample_limit, replace=False)]
-    tgt_n = target_normals if len(target_normals) == len(target) else estimate_normals(tgt)
+    target_indices = np.arange(len(target)) if len(target) <= sample_limit else rng.choice(
+        len(target), sample_limit, replace=False)
+    tgt = target[target_indices]
+    if target_normals is None:
+        tgt_n = estimate_normals(tgt, cancel=cancel)
+    else:
+        target_normals = np.asarray(target_normals, dtype=np.float64)
+        if target_normals.shape != target.shape:
+            raise ValueError("目标法线必须与目标点云逐点对应")
+        tgt_n = target_normals[target_indices]
 
     tree = cKDTree(tgt)
     transform = np.eye(4, dtype=np.float64)
-    transform[:3, 3] = tgt.mean(axis=0) - src.mean(axis=0)
+    if initial_transform is None:
+        transform[:3, 3] = tgt.mean(axis=0) - src.mean(axis=0)
+    else:
+        transform = np.array(initial_transform, dtype=np.float64, copy=True)
+        if transform.shape != (4, 4) or not np.isfinite(transform).all():
+            raise ValueError("初始变换必须是有限的 4×4 矩阵")
     rmse = float("inf")
 
     for it in range(max_iterations):
@@ -156,8 +175,6 @@ def icp_point_to_plane(source: np.ndarray, target: np.ndarray,
         keep = dist <= max_corr_distance
         if trim_ratio < 1.0:
             keep &= dist <= float(np.quantile(dist[keep], trim_ratio)) if keep.any() else keep
-        if keep.sum() < 6:
-            keep = dist <= float(np.quantile(dist, max(trim_ratio, 0.5)))
         if keep.sum() < 6:
             break
 
@@ -193,6 +210,15 @@ def icp_point_to_plane(source: np.ndarray, target: np.ndarray,
             progress((it + 1) / max_iterations)
         if np.linalg.norm(delta[:3]) < tolerance * 10 and np.linalg.norm(delta[3:]) < tolerance:
             break
+    moved = apply_transform(src, transform).astype(np.float64)
+    dist, idx = tree.query(moved, workers=-1)
+    keep = dist <= max_corr_distance
+    if trim_ratio < 1.0 and keep.any():
+        keep &= dist <= np.quantile(dist[keep], trim_ratio)
+    if keep.sum() < 6:
+        raise ValueError("有效对应点不足；请增大对应距离或先执行全局配准")
+    residual = np.einsum("ij,ij->i", tgt_n[idx[keep]], moved[keep] - tgt[idx[keep]])
+    rmse = float(np.sqrt(np.mean(residual ** 2)))
     return transform, rmse
 
 

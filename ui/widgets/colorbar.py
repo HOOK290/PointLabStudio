@@ -6,7 +6,7 @@ import numpy as np
 from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from core.color.colormaps import sample_colormap
@@ -59,7 +59,8 @@ class _GradientCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.fillRect(rect, QColor(20, 22, 26, 220))
+        light = getattr(self.window(), "theme", "dark") == "light"
+        painter.fillRect(rect, QColor("#F2F2F7") if light else QColor(20, 22, 26, 220))
 
         if self._colors is not None and len(self._colors):
             rgb = np.clip(np.asarray(self._colors) * 255.0, 0, 255).astype(np.uint8)
@@ -72,7 +73,7 @@ class _GradientCanvas(QWidget):
             peak = float(np.max(self._hist)) or 1.0
             base = rect.bottom() - 2
             h_avail = rect.height() * 0.52
-            pen = QPen(QColor(120, 170, 230, 150), 1)
+            pen = QPen(QColor("#005FCC") if light else QColor(120, 170, 230, 150), 1)
             painter.setPen(pen)
             w = rect.width() / n
             for i, value in enumerate(self._hist):
@@ -80,7 +81,7 @@ class _GradientCanvas(QWidget):
                 painter.drawLine(int(rect.left() + i * w), int(base),
                                  int(rect.left() + i * w), int(base - h))
 
-        painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        painter.setPen(QPen(QColor("#959DA9") if light else QColor(255, 255, 255, 40), 1))
         painter.drawRect(rect)
         painter.end()
 
@@ -99,9 +100,10 @@ class ColorbarPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(6)
 
-        title = QLabel("颜色条")
-        title.setObjectName("sectionTitle")
-        root.addWidget(title)
+        self.title = QLabel("颜色条")
+        self.title.setObjectName("sectionTitle")
+        self.title.setToolTip("颜色映射与直方图基于原始点云，裁剪不会改变色标")
+        root.addWidget(self.title)
 
         self.combo = QComboBox()
         self.combo.setObjectName("headerCombo")
@@ -119,6 +121,8 @@ class ColorbarPanel(QWidget):
         self.spin_min = QDoubleSpinBox()
         self.spin_max = QDoubleSpinBox()
         for spin in (self.spin_min, self.spin_max):
+            spin.setMinimumWidth(60)
+            spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             spin.setDecimals(3)
             spin.setRange(-1e12, 1e12)
             spin.setSingleStep(0.1)

@@ -38,9 +38,6 @@ def _prepare_gpu_cache() -> None:
 
 _prepare_gpu_cache()
 
-from apps.desktop import main
-
-
 def _report_fatal(detail: str) -> None:
     try:
         from core.applog import get_logger, setup_logging
@@ -64,6 +61,8 @@ def _report_fatal(detail: str) -> None:
 
 if __name__ == "__main__":
     try:
+        from apps.desktop import main
+
         main()
     except SystemExit:
         raise

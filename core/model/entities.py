@@ -1,6 +1,6 @@
 """核心数据模型：CloudEntity / ScalarField。
 
-设计要点（见 docs/产品方案.md §4.3）：
+设计要点：
 - 源数据只读，处理产生派生实体（非破坏性编辑）
 - 每片点云有任意多个命名标量场，颜色模式引用标量场名
 - transform 为 4x4 矩阵，预留多片点云全局配准
@@ -63,6 +63,8 @@ class CloudEntity:
     loaded: float = 1.0                              # 已加载比例 0..1（L 级流式加载）
     info: str = ""
     debug: str = ""
+    load_state: str = "ready"                       # unloaded / loading / ready / error
+    visibility_pinned: bool = False
 
     # ---------- 便捷属性 ----------
     @property

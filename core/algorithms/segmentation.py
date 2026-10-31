@@ -133,6 +133,7 @@ def dbscan(xyz: np.ndarray, eps: float = 0.5, min_samples: int = 10,
     m = len(work)
     labels = np.full(m, -1, dtype=np.int32)
     visited = np.zeros(m, dtype=bool)
+    queued = np.zeros(m, dtype=bool)
     cluster_id = 0
 
     for i in range(m):
@@ -147,13 +148,21 @@ def dbscan(xyz: np.ndarray, eps: float = 0.5, min_samples: int = 10,
         cluster_id += 1
         labels[i] = cluster_id
         queue = list(neighbors)
+        queued[neighbors] = True
+        expanded = 0
         while queue:
+            if expanded % 64 == 0:
+                check_cancel(cancel)
+            expanded += 1
             j = queue.pop()
             if not visited[j]:
                 visited[j] = True
                 n2 = tree.query_ball_point(work[j], eps)
                 if len(n2) >= min_samples:
-                    queue.extend(n2)
+                    new = np.asarray(n2, dtype=np.int64)
+                    new = new[~queued[new]]
+                    queued[new] = True
+                    queue.extend(new.tolist())
             if labels[j] == -1:
                 labels[j] = cluster_id
         if progress is not None and i % 2000 == 0:

@@ -21,9 +21,15 @@ def _subset_fields(entity: CloudEntity, index) -> dict:
 def _make_result(source: CloudEntity, xyz, fields: dict, info: str) -> CloudEntity:
     result = CloudEntity(name=source.name, path=None, xyz=xyz, fields=fields)
     result.color_mode = source.color_mode
+    result.color_field = source.color_field
+    result.color_range = source.color_range
     result.colormap = source.colormap
     result.point_size = source.point_size
     result.info = info
+    if source.is_preview:
+        result.loaded = source.loaded
+        result.tier = source.tier
+        result.info += f"；基于 {source.loaded:.0%} 预览"
     return result
 
 
@@ -74,8 +80,8 @@ def _apply_ror(entity, params, progress, cancel):
 def _apply_crop(entity, params, progress, cancel):
     mn = [params["xmin"], params["ymin"], params["zmin"]]
     mx = [params["xmax"], params["ymax"], params["zmax"]]
-    if any(lo >= hi for lo, hi in zip(mn, mx)):
-        raise ValueError("盒裁切：每个轴的 min 必须小于 max")
+    if any(lo > hi for lo, hi in zip(mn, mx)):
+        raise ValueError("盒裁切：每个轴的 min 不能大于 max")
     keep = filters.crop_box(entity.xyz, mn, mx, progress=progress, cancel=cancel)
     return _masked(entity, keep, "盒裁切")
 

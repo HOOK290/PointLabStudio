@@ -321,6 +321,7 @@ def write_text(entity: CloudEntity, path: str) -> None:
     xyz = np.asarray(entity.xyz, dtype=np.float32)
     scalars = _scalar_fields(entity)
     rgb = _rgb01(entity)
+    color_scale = 255.0 if rgb is not None and rgb.max(initial=0.0) <= 1.5 else 1.0
     ext = os.path.splitext(path)[1].lower()
     sep = "," if ext == ".csv" else " "
     names = ["x", "y", "z"] + [name for name, _ in scalars] + (["r", "g", "b"] if rgb is not None else [])
@@ -332,7 +333,7 @@ def write_text(entity: CloudEntity, path: str) -> None:
             values = [f"{xyz[i, 0]:.6f}", f"{xyz[i, 1]:.6f}", f"{xyz[i, 2]:.6f}"]
             values += [f"{data[i]:.6f}" for _, data in scalars]
             if rgb is not None:
-                cols = rgb[i] * 255.0 if rgb.max(initial=0.0) <= 1.5 else rgb[i]
+                cols = rgb[i] * color_scale
                 values += [str(int(round(float(c)))) for c in np.clip(cols, 0, 255)]
             f.write(sep.join(values) + "\n")
 
@@ -341,6 +342,7 @@ def write_pts(entity: CloudEntity, path: str) -> None:
     """标准 PTS：首行点数，随后 x y z [intensity] r g b。"""
     xyz = np.asarray(entity.xyz, dtype=np.float32)
     rgb = _rgb01(entity)
+    color_scale = 255.0 if rgb is not None and rgb.max(initial=0.0) <= 1.5 else 1.0
     intensity = entity.fields.get("intensity")
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(f"{xyz.shape[0]}\n")
@@ -349,7 +351,7 @@ def write_pts(entity: CloudEntity, path: str) -> None:
             if intensity is not None:
                 row.append(f"{float(intensity.data[i]):.6f}")
             if rgb is not None:
-                cols = rgb[i] * 255.0 if rgb.max(initial=0.0) <= 1.5 else rgb[i]
+                cols = rgb[i] * color_scale
                 row += [str(int(round(float(c)))) for c in np.clip(cols, 0, 255)]
             f.write(" ".join(row) + "\n")
 

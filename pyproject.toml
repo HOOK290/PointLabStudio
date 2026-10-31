@@ -1,6 +1,6 @@
 [project]
 name = "pointlab-studio"
-version = "1.0.0"
+version = "1.1.0"
 description = "PointLabStudio — 桌面点云综合处理平台（PySide6 + pygfx）"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -11,20 +11,7 @@ dependencies = [
     "PySide6>=6.6,<7",
     "pygfx>=0.4,<0.18",
     "wgpu>=0.17,<0.33",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8,<10",
-]
-
-# 仅用于工具链配置；本项目以源码方式运行，不需要构建/发布安装包。
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-addopts = "-ra"
-filterwarnings = [
-    "ignore::DeprecationWarning",
+    "rendercanvas>=2.7,<3",
 ]
 
 [tool.ruff]

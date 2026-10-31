@@ -27,9 +27,9 @@ def export_entity(entity, path: str, *, include_fields: bool = True) -> None:
         from core.io.las_io import write_las
         write_las(entity, path)
     elif ext == ".laz":
-        raise ValueError("导出 .laz 需要 laspy[lazrs]：请先安装，或导出为 .las/.ply")
+        raise ValueError("暂不支持导出 .laz，请改用 .las/.ply")
     elif ext == ".e57":
-        raise ValueError("导出 .e57 需要 pye57：请先安装，或导出为 .las/.ply")
+        raise ValueError("暂不支持导出 .e57，请改用 .las/.ply")
     elif ext == ".ply":
         native_io.write_ply(entity, path)
     elif ext == ".pcd":
