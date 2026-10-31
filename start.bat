@@ -22,8 +22,8 @@ echo.
 echo [PointLab Studio] 没有找到虚拟环境 .venv
 echo.
 echo 首次运行请在同一目录执行：
-echo     python -m venv --system-site-packages .venv
-echo     .venv\Scripts\python.exe -m pip install -r requirements.txt
+echo     python -m venv .venv
+echo     .venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 echo.
 pause
 exit /b 1

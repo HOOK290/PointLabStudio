@@ -1,4 +1,4 @@
-# 已知可用的精确版本（Python 3.12 / Windows 11 实测通过 61 项测试）。
+# 已知可用的精确版本（Python 3.12 / Windows 11 实测通过 181 项测试）。
 # 用法：.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 # 需要重新求解依赖时用 requirements.txt；升级依赖后请重跑 tools/run_tests.py 并更新本文件。
 numpy==2.5.4

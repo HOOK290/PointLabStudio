@@ -2,6 +2,21 @@
 
 本文件按审查报告的执行清单（26 项）记录 v0.7 的落地内容。每一项都有对应的自动化测试或实测数据。
 
+## v1.0.0（2026-10-31）
+
+首个 1.0 发布。功能集与 v0.8.1 一致，本版集中处理「开源可用性」：
+
+- **版本号统一为 `1.0.0`**：`core.__version__`、`pyproject.toml`、界面右下角一致。
+- **README 重写**：补齐系统要求（Python ≥3.11、Windows 10/11 64 位、Vulkan/DX12 显卡）、
+  安装步骤（`requirements-lock.txt` 锁定版本）、测试数据生成、测试自检、CLI 用法、
+  不入库文件说明与常见问题；修正原文中失效的命令、过时的「未配置远程」说明与测试数量。
+- **修复全新克隆跑测试失败**：`tools/run_tests.py` 只设置 `PYGFX_DATA_DIR` 而不创建目录，
+  导致新检出的仓库有 9 个测试模块在收集阶段 `FileNotFoundError`；现在会先确保
+  `.tmp/pygfx` 存在。净副本实测 `181 passed`。
+- **`start.bat` 提示同步**：缺环境时给出的命令改为标准的 `python -m venv .venv` +
+  `requirements-lock.txt`。
+- 仓库跟踪 116 个文件；`.venv/`、`data/`、`.tmp/`、`__pycache__/`、`*.pls` 等按 `.gitignore` 不入库。
+
 ## v0.8.1（2026-10-31）
 
 ### 交互手感

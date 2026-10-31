@@ -44,7 +44,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sandbox", action="store_true", help="启用受限沙箱兼容模式")
     args, rest = parser.parse_known_args(argv)
 
-    os.environ.setdefault("PYGFX_DATA_DIR", str(ROOT / ".tmp" / "pygfx"))
+    pygfx_dir = Path(os.environ.get("PYGFX_DATA_DIR") or (ROOT / ".tmp" / "pygfx"))
+    try:  # 全新克隆没有 .tmp/pygfx，pygfx 导入时会直接失败
+        pygfx_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    os.environ.setdefault("PYGFX_DATA_DIR", str(pygfx_dir))
     if args.sandbox:
         _prepare_sandbox()
 
