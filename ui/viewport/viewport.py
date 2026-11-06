@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import time
+import sys
 from typing import Optional
 
 import numpy as np
@@ -859,7 +860,9 @@ class PointCloudViewport(RenderCanvas):
             speed *= 0.25  # 按住 Shift 精调
         self._yaw = float((self._yaw - float(dx) * speed + np.pi) % (2.0 * np.pi) - np.pi)
         if not self._fixed_view:
-            self._pitch = float((self._pitch - float(dy) * speed + np.pi)
+            # macOS 左键纵向拖拽采用反向俯仰；不读取或改变系统滚动方向。
+            vertical_direction = 1.0 if sys.platform == "darwin" else -1.0
+            self._pitch = float((self._pitch + vertical_direction * float(dy) * speed + np.pi)
                                 % (2.0 * np.pi) - np.pi)
         self._apply_camera()
         if self._fixed_view:
@@ -1577,6 +1580,9 @@ class PointCloudViewport(RenderCanvas):
             return
         pixels = event.pixelDelta().y()
         notches = pixels / 50.0 if pixels else event.angleDelta().y() / 120.0
+        # 消除系统“自然滚动”反转，缩放始终跟随滚轮的物理方向。
+        if event.inverted():
+            notches = -notches
         self.zoom_camera(notches)
         event.accept()
 
