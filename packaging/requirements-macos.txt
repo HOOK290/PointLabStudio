@@ -1,0 +1,2 @@
+-r ../requirements-build.txt
+libusb-package==1.0.30.0
