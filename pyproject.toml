@@ -1,6 +1,6 @@
 [project]
 name = "pointlab-studio"
-version = "1.1.0"
+version = "1.1.1"
 description = "PointLabStudio — 桌面点云综合处理平台（PySide6 + pygfx）"
 readme = "README.md"
 requires-python = ">=3.11"

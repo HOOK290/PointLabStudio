@@ -14,12 +14,18 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import sys
+import tempfile
 import time
-from weakref import WeakKeyDictionary
+from uuid import uuid4
+from copy import deepcopy
+from dataclasses import dataclass
+from weakref import WeakKeyDictionary, WeakSet
 
 import numpy as np
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEventLoop, QProcess, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenu,
@@ -33,6 +39,7 @@ from core.color.colormaps import COLOR_MODE_LABELS, list_colormaps
 from core.i18n import tr
 from core.plugin import load_plugins
 from core.settings import load_settings, save_settings
+from ui.project_session import ProjectSessionMixin
 from core.cancellation import OperationCancelled
 from core.commands import Command, History
 from core.commands.spec import get_spec
@@ -43,6 +50,7 @@ from core.io.auto_ingest import plan_ingest, tier_by_points
 from core.io.measurements import write_measurements_csv
 from core.io.readers import ReadOptions, read_cloud, read_stream_bin
 from core.io.scanner import collect_files, natural_key
+from core.io.source_ops import move_sources, relocate_path, rename_source
 from core.model.entities import COLOR_MODES, CloudEntity, MeshEntity, ScalarField
 from core.pipeline import run_pipeline
 from ui.theme import build_stylesheet
@@ -115,7 +123,7 @@ class LoadThread(QThread):
 
 
 class ScanThread(QThread):
-    done = Signal(list)
+    done = Signal(object)
     failed = Signal(str)
 
     def __init__(self, paths, parent=None):
@@ -124,15 +132,55 @@ class ScanThread(QThread):
 
     def run(self):
         files = []
+        directories = []
         for path in self.paths:
             try:
                 files.extend(collect_files(path, cancel=self.isInterruptionRequested))
+                if os.path.isdir(path):
+                    for folder, children, _names in os.walk(path):
+                        if self.isInterruptionRequested():
+                            return
+                        directories.append(folder)
+                        directories.extend(os.path.join(folder, name) for name in children)
             except OperationCancelled:
                 return
             except Exception as exc:
                 self.failed.emit(f"收集失败: {path} — {exc}")
         if not self.isInterruptionRequested():
-            self.done.emit(sorted(set(files), key=natural_key))
+            self.done.emit({"files": sorted(set(files), key=natural_key),
+                            "directories": sorted(set(directories), key=natural_key)})
+
+
+class SourceOperationThread(QThread):
+    done = Signal(object)
+    failed = Signal(object)
+
+    def __init__(self, worker, parent=None):
+        super().__init__(parent)
+        self.worker = worker
+
+    def run(self):
+        try:
+            self.done.emit(self.worker())
+        except Exception as exc:
+            self.failed.emit(exc)
+
+
+@dataclass(eq=False)
+class SceneSnapshot:
+    entities: list
+    current: object
+    tree: dict
+    visibility: list
+    explicit: set
+
+
+@dataclass(eq=False)
+class TrashRecord:
+    before: SceneSnapshot
+    after: SceneSnapshot
+    sources: list
+    moves: list
 
 
 class FilterThread(QThread):
@@ -185,7 +233,7 @@ class EpsThread(QThread):
                 self.failed.emit(str(exc))
 
 
-class MainWindow(QMainWindow):
+class MainWindow(ProjectSessionMixin, QMainWindow):
     def __init__(self, start_path: str | None = None, theme: str = "dark"):
         super().__init__()
         self.setWindowTitle(tr("PointLab Studio — 点云综合处理平台"))
@@ -214,6 +262,12 @@ class MainWindow(QMainWindow):
         self._scan_threads = []
         self._frame_cache = {}
         self._result_sources = WeakKeyDictionary()
+        self._known_source_entities = WeakSet()
+        self._scene_snapshots = WeakSet()
+        self._trash_records = WeakSet()
+        self._source_operation = None
+        self._deferred_imports = []
+        self._pending_regroups = []
         self._camera_initialized = False
         self._restoring_project = False
         self._auto_mesh = None
@@ -232,6 +286,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_shortcuts()
         self._connect_signals()
+        self._init_project_session()
 
         self.log("PointLab Studio 已启动。拖入点云文件或文件夹即可查看。")
         if start_path:
@@ -255,7 +310,7 @@ class MainWindow(QMainWindow):
         body.setSpacing(10)
 
         self.scene_panel = ScenePanel()
-        self.scene_panel.setFixedWidth(232)
+        self.scene_panel.setFixedWidth(300)
 
         self.overview = OverviewPanel()
         self.overview_scroll = QScrollArea()
@@ -322,8 +377,11 @@ class MainWindow(QMainWindow):
         self.btn_project.setObjectName("headerBtn")
         self.btn_project.setText("工程")
         proj_menu = QMenu(self.btn_project)
+        proj_menu.addAction("新建工程", self._new_project)
         proj_menu.addAction("打开工程…", self._open_project_dialog)
         proj_menu.addAction("保存工程…", self._save_project_dialog)
+        proj_menu.addAction("另存工程为…", self._save_project_as_dialog)
+        proj_menu.addAction("关闭工程", self._close_project)
         proj_menu.addSeparator()
         proj_menu.addAction("导出当前点云…", self._export_current_dialog)
         self.act_export_clipped = proj_menu.addAction("导出裁剪内点云…", self._export_clipped_dialog)
@@ -688,6 +746,10 @@ class MainWindow(QMainWindow):
         for seq, slot in shortcuts.items():
             sc = QShortcut(QKeySequence(seq), self)
             sc.activated.connect(slot)
+        if sys.platform == "darwin":
+            # Qt maps Ctrl to macOS Command and Meta to the physical Control key.
+            self._physical_control_save = QShortcut(QKeySequence("Meta+S"), self)
+            self._physical_control_save.activated.connect(self._save_project_dialog)
 
     def _connect_signals(self):
         # 场景面板
@@ -695,8 +757,15 @@ class MainWindow(QMainWindow):
         self.scene_panel.visibility_changed.connect(self._on_visibility_changed)
         self.scene_panel.focus_requested.connect(self._focus_entity)
         self.scene_panel.remove_requested.connect(self._remove_entity)
+        self.scene_panel.remove_selection_requested.connect(self._request_remove_selection)
+        self.scene_panel.rename_requested.connect(self._rename_source)
+        self.scene_panel.reveal_source_requested.connect(self._reveal_source)
+        self.scene_panel.move_requested.connect(self._request_move_sources)
+        self.scene_panel.visibility_selection_requested.connect(self._on_visibility_selection)
+        self.scene_panel.files_open_requested.connect(self.open_paths)
         self.scene_panel.reload_requested.connect(self._reload_entity)
         self.scene_panel.open_requested.connect(self._open_files_dialog)
+        self.scene_panel.open_folder_requested.connect(self._open_folder_dialog)
 
         # 顶栏视图控件
         self.cmb_color.currentIndexChanged.connect(self._on_header_color)
@@ -859,11 +928,43 @@ class MainWindow(QMainWindow):
         self.frame_browser.set_reference(self._reference_entity())
 
     def _toggle_selected_visibility(self):
-        entity = self.scene_panel.current_entity()
-        if entity is None:
+        selection = self.scene_panel._selection_payload()
+        if not selection["entities"]:
             self.log("请先在左侧场景中选择一片点云")
             return
-        self.scene_panel.set_visible(entity, not entity.visible)
+        action = "show" if any(not e.visible for e in selection["entities"]) else "hide"
+        self._on_visibility_selection(selection, action)
+
+    def _on_visibility_selection(self, selection, action):
+        targets = [e for e in dict.fromkeys(selection.get("entities", [])) if e in self.entities]
+        if not targets:
+            return
+        before = [(e, e.visible, e.visibility_pinned) for e in targets]
+        after = []
+        for entity, visible, pinned in before:
+            if action == "show":
+                visible = True
+            elif action == "hide":
+                visible, pinned = False, False
+            elif action == "pin":
+                visible, pinned = True, True
+            elif action == "unpin":
+                pinned = False
+            else:
+                return
+            after.append((entity, visible, pinned))
+
+        def apply(states):
+            for entity, visible, pinned in states:
+                entity.visible, entity.visibility_pinned = visible, pinned
+            self._refresh_scene()
+        if before == after:
+            return
+        label = {"show": "临时显示", "hide": "隐藏", "pin": "固定叠加", "unpin": "取消固定叠加"}[action]
+        self.history.push(f"{label}（{len(targets)} 片点云）",
+                          lambda: apply(before), lambda: apply(after))
+        apply(after)
+        self._update_history_buttons()
 
     def _on_visibility_changed(self, entity):
         visible = entity.visible
@@ -1051,6 +1152,11 @@ class MainWindow(QMainWindow):
     # ================= Auto-Ingest 加载 =================
     def open_paths(self, paths: list):
         paths = [os.path.abspath(p) for p in paths if p]
+        if self._source_operation is not None:
+            self._deferred_imports.extend(paths)
+            self.log("路径操作进行中，已排队追加打开文件。")
+            return
+        self.scene_panel.add_roots([p for p in paths if os.path.isdir(p)])
         for source in paths:
             if os.path.exists(source):
                 self.settings.add_recent(source)
@@ -1058,7 +1164,7 @@ class MainWindow(QMainWindow):
         if any(os.path.isdir(p) for p in paths):
             thread = ScanThread(paths, self)
             self._scan_threads.append(thread)
-            thread.done.connect(self._register_files)
+            thread.done.connect(self._register_scan)
             thread.failed.connect(self.log)
             thread.finished.connect(lambda t=thread: self._finish_scan(t))
             self.log("正在扫描文件夹…")
@@ -1070,6 +1176,15 @@ class MainWindow(QMainWindow):
         if thread in self._scan_threads:
             self._scan_threads.remove(thread)
         thread.deleteLater()
+        if not self._scan_threads:
+            pending, self._pending_regroups = self._pending_regroups, []
+            for paths, destination in pending:
+                self._regroup_sources(paths, destination)
+
+    def _register_scan(self, result):
+        if not self._closing:
+            self.scene_panel.add_directories(result["directories"])
+            self._register_files(result["files"])
 
     def _register_files(self, files):
         if self._closing:
@@ -1088,6 +1203,7 @@ class MainWindow(QMainWindow):
                                      load_state="unloaded", loaded=0.0)
                 self._apply_pending(entity)
                 self.entities.append(entity)
+                self._known_source_entities.add(entity)
                 self._frame_cache[entity] = time.monotonic()
                 self.scene_panel.add_entity(entity)
                 added.append(entity)
@@ -1138,7 +1254,7 @@ class MainWindow(QMainWindow):
         return list(dict.fromkeys(e for e in wanted if e is not None))
 
     def _schedule_frame_loads(self):
-        if self._closing or self._restoring_project:
+        if self._closing or self._restoring_project or self._source_operation is not None:
             return
         wanted = self._wanted_frames()
         for thread in self._threads.values():
@@ -1189,6 +1305,8 @@ class MainWindow(QMainWindow):
         if self._closing:
             self._load_queue.clear()
             return
+        if self._source_operation is not None:
+            return
         while self._load_queue and len(self._threads) < self.MAX_LOAD_THREADS:
             path = self._load_queue.pop(0)
             if path in self._threads:
@@ -1197,6 +1315,7 @@ class MainWindow(QMainWindow):
 
     def _add_entity(self, entity: CloudEntity):
         self.entities.append(entity)
+        self._known_source_entities.add(entity)
         self._apply_pending(entity)
         self.scene_panel.add_entity(entity)
         if not self._restoring_project:
@@ -1274,40 +1393,476 @@ class MainWindow(QMainWindow):
 
     # ================= 场景操作 =================
     def _remove_entity(self, entity: CloudEntity):
-        if entity not in self.entities:
-            return
-        index = self.entities.index(entity)
-        was_visible = entity.visible
-        thread = self._threads.get(entity.path)
-        if thread is not None:
-            thread.requestInterruption()
-        if entity.path in self._load_queue:
-            self._load_queue.remove(entity.path)
-        self.entities.remove(entity)
-        self._frame_cache.pop(entity, None)
-        self.scene_panel.remove_entity(entity)
+        self._remove_selection({"entities": [entity], "folders": []})
+
+    def _scene_snapshot(self):
+        snapshot = SceneSnapshot(
+            list(self.entities), self.scene_panel.current_entity(),
+            deepcopy(self.scene_panel.tree_state()),
+            [(e, e.visible, e.visibility_pinned) for e in self.entities],
+            set(self._explicit_loads),
+        )
+        self._scene_snapshots.add(snapshot)
+        return snapshot
+
+    def _restore_scene_snapshot(self, snapshot):
+        live = set(snapshot.entities)
+        for thread in self._threads.values():
+            if thread.entity not in live:
+                thread.requestInterruption()
+        self._load_queue = [p for p in self._load_queue if any(e.path == p for e in live)]
+        self._frame_cache = {e: stamp for e, stamp in self._frame_cache.items() if e in live}
+        self.entities[:] = snapshot.entities
+        self._known_source_entities.update(self.entities)
+        self._explicit_loads = set(snapshot.explicit)
+        self._restoring_project = True
+        try:
+            self.scene_panel.restore_tree_state(snapshot.tree)
+            self.scene_panel.set_entities(self.entities)
+            for entity, visible, pinned in snapshot.visibility:
+                entity.visible, entity.visibility_pinned = visible, pinned
+                if entity.path:
+                    self._frame_cache[entity] = time.monotonic()
+            if snapshot.current in self.entities:
+                self.scene_panel.select_entity(snapshot.current)
+            self.scene_panel.restore_tree_state(snapshot.tree)
+        finally:
+            self._restoring_project = False
         self._show_entity(self.scene_panel.current_entity())
         self._refresh_scene()
-        self.log(f"已移除: {entity.name}（Ctrl+Z 可恢复）")
 
-        def undo():
-            self.entities.insert(min(index, len(self.entities)), entity)
-            if entity.path:
-                self._frame_cache[entity] = time.monotonic()
-            entity.visible = was_visible
-            self.scene_panel.set_entities(self.entities)
-            self.scene_panel.select_entity(entity)
-            self._show_entity(entity)
-            self._refresh_scene()
+    def _selection_source_paths(self, selection):
+        from core.io.source_ops import minimal_source_paths
+        paths = list(selection.get("source_paths", []))
+        paths.extend(e.path for e in selection.get("entities", []) if e.path)
+        paths.extend(self.scene_panel.source_path(folder) for folder in selection.get("folders", []))
+        return minimal_source_paths(paths)
 
-        def redo():
-            self._remove_entity_now(entity)
+    def _choose_delete_mode(self, selection):
+        try:
+            paths = self._selection_source_paths(selection)
+        except (OSError, ValueError):
+            paths = []
+        box = QMessageBox(self)
+        box.setWindowTitle("删除所选项目")
+        box.setText(f"已选择 {len(selection.get('entities', []))} 片点云、{len(selection.get('folders', []))} 个文件夹。")
+        box.setInformativeText("仅移出工程会保留硬盘原文件。移到废纸篓会同步删除原位置的文件；选中文件夹时包含其中的全部内容。")
+        box.setDetailedText("\n".join(paths) or "所选内容没有磁盘源文件。")
+        scene = box.addButton("仅移出工程", QMessageBox.AcceptRole)
+        disk = box.addButton("移到废纸篓", QMessageBox.DestructiveRole)
+        disk.setEnabled(bool(paths))
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(scene)
+        box.exec()
+        return "scene" if box.clickedButton() is scene else "disk" if box.clickedButton() is disk else None
 
-        self.history.push(f"移除 {entity.name}", undo, redo)
+    def _request_remove_selection(self, selection):
+        if self._source_operation is not None or self._scan_threads:
+            self._flash_status("正在扫描或操作文件，请稍后再删除。", 6000)
+            return
+        mode = self._choose_delete_mode(selection)
+        if mode == "scene":
+            self._remove_selection(selection)
+        elif mode == "disk":
+            self._trash_selection(selection)
+
+    def _trash_selection(self, selection):
+        from core.io.source_ops import trash_sources
+        if not self._source_edit_allowed():
+            return False
+        try:
+            paths = self._selection_source_paths(selection)
+        except (OSError, ValueError) as exc:
+            self._flash_status(str(exc), 6000)
+            return False
+        if not paths:
+            return self._remove_selection(selection)
+
+        def completed(moves):
+            self._record_trashed_selection(moves, selection)
+        def failed(error):
+            moves = getattr(error, "remaining_moves", [])
+            if moves:
+                self._record_trashed_selection(moves, selection)
+            self.log("移到废纸篓未全部完成：" + str(error))
+            self._flash_status("部分文件未删除，请查看日志。", 7000)
+        return self._start_source_operation(lambda: trash_sources(paths), "移到废纸篓",
+                                            on_success=completed, on_failure=failed)
+
+    def _record_trashed_selection(self, moves, selection):
+        def affected(path):
+            return bool(path) and any(path == old or path.startswith(old.rstrip(os.sep) + os.sep)
+                                      for old, _trash in moves)
+        targets = [e for e in self.entities if affected(e.path) or
+                   (not e.path and e in selection.get("entities", []))]
+        folders = [folder for folder in selection.get("folders", [])
+                   if affected(self.scene_panel.source_path(folder))]
+        result = self._remove_selection({"entities": targets, "folders": folders},
+                                        record_history=False, expand_folders=False)
+        if result is None:
+            return
+        before, after = result
+        record = TrashRecord(before, after, [old for old, _trash in moves], list(moves))
+        self._trash_records.add(record)
+        self.history.push(f"移到废纸篓（{len(moves)} 项）",
+                          lambda: self._restore_trash_history(record),
+                          lambda: self._redo_trash_history(record))
+        self.log(f"已将 {len(moves)} 项原文件移到废纸篓；撤销会先恢复原文件。")
         self._update_history_buttons()
+
+    def _run_history_source_operation(self, worker, label, on_success, on_failure):
+        """Wait in a Qt event loop so history advances only after a safe disk operation."""
+        loop = QEventLoop(self)
+        succeeded = False
+        def completed(changes):
+            nonlocal succeeded
+            on_success(changes)
+            succeeded = True
+        if not self._start_source_operation(worker, label, on_success=completed, on_failure=on_failure):
+            return False
+        self._source_operation.finished.connect(loop.quit)
+        loop.exec()
+        return succeeded
+
+    def _restore_trash_history(self, record):
+        from core.io.source_ops import restore_trashed
+        if any(not trash for _old, trash in record.moves):
+            self.log("系统未提供可恢复路径，请在访达废纸篓中恢复原文件。")
+            self._flash_status("请先从访达废纸篓恢复原文件。", 7000)
+            return False
+        def completed(_changes):
+            record.moves[:] = []
+            self._apply_removal_history(record.before, record.after, restore=True)
+        def failed(error):
+            restored = {original for _trash, original in getattr(error, "remaining_moves", [])}
+            record.moves[:] = [(original, trash) for original, trash in record.moves
+                               if original not in restored]
+            self.log("恢复原文件失败，未覆盖现有文件，可处理冲突后重试撤销：" + str(error))
+            self._flash_status("恢复未完成；请处理同名冲突后重试撤销。", 7000)
+        return self._run_history_source_operation(lambda: restore_trashed(record.moves),
+                                                 "恢复原文件", completed, failed)
+
+    def _redo_trash_history(self, record):
+        from core.io.source_ops import trash_sources
+        def completed(moves):
+            record.moves[:] = moves
+            self._apply_removal_history(record.before, record.after, restore=False)
+        def failed(error):
+            moves = list(getattr(error, "remaining_moves", []))
+            record.moves[:] = moves
+            if moves:
+                self._record_trashed_selection(moves, {"entities": [], "folders": []})
+            self.log("重新移到废纸篓失败：" + str(error))
+            self._flash_status("重做未完成，请查看日志。", 7000)
+        return self._run_history_source_operation(lambda: trash_sources(record.sources),
+                                                 "重新移到废纸篓", completed, failed)
+
+    def _remove_selection(self, selection, *, record_history=True, expand_folders=True):
+        if record_history and (self._source_operation is not None or self._scan_threads):
+            self._flash_status("正在扫描或移动文件，请稍后再移除。", 6000)
+            return
+        folders = selection.get("folders", [])
+        requested = set(selection.get("entities", []))
+        targets = {
+            e for e in self.entities
+            if e in requested or (expand_folders and e.path and any(
+                self.scene_panel.display_path(e.path) == p or
+                self.scene_panel.display_path(e.path).startswith(p.rstrip(os.sep) + os.sep) for p in folders
+            ))
+        }
+        before = self._scene_snapshot()
+        roots = [p for p in before.tree.get("roots", []) if not any(
+            self.scene_panel.display_path(p) == f or
+            self.scene_panel.display_path(p).startswith(f.rstrip(os.sep) + os.sep) for f in folders
+        )]
+        if not targets and not folders:
+            return
+        remaining = [e for e in self.entities if e not in targets]
+        current = before.current
+        if current not in remaining:
+            index = self.entities.index(current) if current in self.entities else 0
+            current = remaining[min(index, len(remaining) - 1)] if remaining else None
+        tree = deepcopy(before.tree)
+        tree["roots"] = roots
+        for key in ("directories", "expanded"):
+            tree[key] = [p for p in tree.get(key, []) if not any(
+                (self.scene_panel.display_path(p) if key == "directories" else p) == f or
+                (self.scene_panel.display_path(p) if key == "directories" else p).startswith(f.rstrip(os.sep) + os.sep)
+                for f in folders
+            )]
+        target_paths = {e.path for e in targets if e.path}
+        remaining_paths = [e.path for e in remaining if e.path]
+        tree["placements"] = {source: group for source, group in tree.get("placements", {}).items()
+                              if source not in target_paths and (any(
+                                  p == source or p.startswith(source.rstrip(os.sep) + os.sep) for p in remaining_paths)
+                                  or not any(group == f or group.startswith(f.rstrip(os.sep) + os.sep) for f in folders))}
+        after = SceneSnapshot(
+            remaining, current, tree,
+            [(e, e.visible or e is current, e.visibility_pinned) for e in remaining],
+            before.explicit - targets,
+        )
+        self._scene_snapshots.add(after)
+        self._restore_scene_snapshot(after)
+        label = f"删除所选（{len(targets)} 片点云）"
+        if record_history:
+            self.history.push(label, lambda: self._apply_removal_history(before, after, restore=True),
+                              lambda: self._apply_removal_history(before, after, restore=False))
+        self.log(f"已从场景移除 {len(targets)} 片点云；磁盘文件未删除，可整批撤销。")
+        self._update_history_buttons()
+        return before, after
+
+    def _apply_removal_history(self, before, after, *, restore):
+        """Replay only this removed batch; later append-imports stay in the scene."""
+        targets = set(before.entities) - set(after.entities)
+        live = self._scene_snapshot()
+        entities = list(live.entities)
+        if restore:
+            for index, entity in enumerate(before.entities):
+                if entity not in targets or entity in entities:
+                    continue
+                anchor = next((e for e in before.entities[index + 1:] if e in entities), None)
+                entities.insert(entities.index(anchor) if anchor is not None else len(entities), entity)
+        else:
+            entities = [e for e in entities if e not in targets]
+        tree = deepcopy(live.tree)
+        for key in ("roots", "directories", "expanded"):
+            removed = set(before.tree.get(key, [])) - set(after.tree.get(key, []))
+            tree[key] = (list(dict.fromkeys([*tree.get(key, []), *removed])) if restore
+                         else [p for p in tree.get(key, []) if p not in removed])
+        placements = tree.setdefault("placements", {})
+        removed_placements = {p: group for p, group in before.tree.get("placements", {}).items()
+                              if p not in after.tree.get("placements", {})}
+        if restore:
+            placements.update(removed_placements)
+        else:
+            for source in removed_placements:
+                placements.pop(source, None)
+        current = live.current if live.current in entities else None
+        if current is None:
+            current = before.current if restore and before.current in entities else (
+                entities[0] if entities else None)
+        visibility = {e: (visible, pinned) for e, visible, pinned in live.visibility}
+        if restore:
+            visibility.update({e: (visible, pinned) for e, visible, pinned in before.visibility
+                               if e in targets})
+        snapshot = SceneSnapshot(
+            entities, current, tree,
+            [(e, *visibility.get(e, (e.visible, e.visibility_pinned))) for e in entities],
+            (live.explicit | (before.explicit & targets)) if restore else live.explicit - targets,
+        )
+        self._restore_scene_snapshot(snapshot)
+
+    def _source_edit_allowed(self):
+        if (self._source_operation is not None or self._threads or self._scan_threads
+                or self._filter_thread is not None or self._restoring_project):
+            self._flash_status("文件正在加载、处理或移动，请稍后再重命名／移动。", 6000)
+            self.log("路径操作未执行：请等待当前加载／处理任务结束。")
+            return False
+        return True
+
+    def _start_source_operation(self, worker, label, imports=(), *, on_success=None, on_failure=None):
+        if not self._source_edit_allowed():
+            return False
+        if self._clip_commit_timer.isActive():
+            self._clip_commit_timer.stop()
+            self._commit_clip_history()
+        thread = SourceOperationThread(worker, self)
+        self._source_operation = thread
+        thread.done.connect(on_success or (lambda changes: self._on_source_changes(changes, list(imports), label)))
+        thread.failed.connect(on_failure or self._on_source_failure)
+        thread.finished.connect(self._on_source_finished)
+        self.centralWidget().setEnabled(False)
+        self.status_task.setText(label + "…")
+        self.log(label + "…")
+        thread.start()
+        return True
+
+    def _rename_source(self, path, name):
+        def worker():
+            renamed = rename_source(path, name)
+            return [(path, renamed)] if renamed != path else []
+        self._start_source_operation(worker, "重命名")
+
+    def _reveal_source(self, path):
+        if not path or not os.path.lexists(path):
+            self._flash_status("源文件不存在，无法打开所在文件夹。", 6000)
+            self.log(f"无法定位源文件：{path or '没有源文件'}")
+            return False
+        path = os.path.abspath(path)
+        try:
+            if sys.platform == "darwin":
+                opened, _pid = QProcess.startDetached("/usr/bin/open", ["-R", path])
+            else:
+                from PySide6.QtCore import QUrl
+                from PySide6.QtGui import QDesktopServices
+                opened = QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
+            if not opened:
+                raise OSError("无法启动文件管理器")
+        except (OSError, RuntimeError) as exc:
+            self.log(f"打开文件所在文件夹失败：{exc}")
+            self._flash_status("无法打开文件所在文件夹，请查看日志。", 6000)
+            return False
+        return True
+
+    def _move_sources(self, paths, destination):
+        paths = list(dict.fromkeys(os.path.abspath(p) for p in paths))
+        imports = self._external_sources(paths)
+        def completed(changes):
+            self.scene_panel.clear_placements([old for old, _new in changes])
+            self._on_source_changes(changes, imports, "移动文件")
+        return self._start_source_operation(lambda: move_sources(paths, destination), "移动文件", imports,
+                                            on_success=completed)
+
+    def _external_sources(self, paths):
+        known = {e.path for e in self.entities if e.path}
+        known.update(self.scene_panel.tree_state().get("directories", []))
+        return [p for p in paths if os.path.abspath(p) not in known]
+
+    def _choose_move_mode(self, paths, destination):
+        box = QMessageBox(self)
+        box.setWindowTitle("移动到文件夹")
+        box.setText(f"将 {len(paths)} 项移到「{os.path.basename(destination)}」？")
+        box.setInformativeText("仅调整工程分组会保留原文件路径；同时移动硬盘原文件会改变实际位置。同名文件不会被覆盖。")
+        box.setDetailedText("目标分组：" + destination + "\n\n" + "\n".join(paths))
+        scene = box.addButton("仅调整工程中的分组", QMessageBox.AcceptRole)
+        disk = box.addButton("同时移动硬盘原文件", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(scene)
+        box.exec()
+        return "scene" if box.clickedButton() is scene else "disk" if box.clickedButton() is disk else None
+
+    def _request_move_sources(self, paths, destination):
+        if self._source_operation is not None or self._scan_threads:
+            self._flash_status("正在扫描或操作文件，请稍后再移动。", 6000)
+            return
+        mode = self._choose_move_mode(paths, destination)
+        if mode == "disk":
+            self._move_sources(paths, self.scene_panel.source_path(destination))
+        elif mode == "scene":
+            external = self._external_sources(paths)
+            if external:
+                self.open_paths(external)
+            if self._scan_threads:
+                self._pending_regroups.append((paths, destination))
+            else:
+                self._regroup_sources(paths, destination)
+
+    def _regroup_sources(self, paths, destination):
+        before = self._scene_snapshot()
+        try:
+            self.scene_panel.regroup_paths(paths, destination)
+        except (ValueError, OSError) as exc:
+            self.log("调整分组失败：" + str(exc))
+            self._flash_status("分组未移动：" + str(exc), 6000)
+            return
+        after = self._scene_snapshot()
+        if before.tree == after.tree:
+            return
+        self.history.push("调整工程分组", lambda: self._apply_group_history(before, after, restore=True),
+                          lambda: self._apply_group_history(before, after, restore=False))
+        self._update_history_buttons()
+        self._flash_status("已调整工程分组，硬盘原路径未改变。", 5000)
+
+    def _apply_group_history(self, before, after, *, restore):
+        tree = self.scene_panel.tree_state()
+        previous, target = (after.tree, before.tree) if restore else (before.tree, after.tree)
+        for key in ("roots", "directories", "expanded"):
+            removed = set(previous.get(key, [])) - set(target.get(key, []))
+            added = set(target.get(key, [])) - set(previous.get(key, []))
+            tree[key] = list(dict.fromkeys([p for p in tree.get(key, []) if p not in removed] + sorted(added)))
+        placements = tree.setdefault("placements", {})
+        for path in previous.get("placements", {}).keys() | target.get("placements", {}).keys():
+            if previous.get("placements", {}).get(path) == target.get("placements", {}).get(path):
+                continue
+            if path in target.get("placements", {}):
+                placements[path] = target["placements"][path]
+            else:
+                placements.pop(path, None)
+        self.scene_panel.restore_tree_state(tree)
+
+    def _apply_source_changes(self, changes):
+        def mapped(path):
+            for old, new in changes:
+                path = relocate_path(path, old, new)
+            return path
+        for entity in self._known_source_entities:
+            if entity.path:
+                old = entity.path
+                entity.path = mapped(old)
+                if os.path.basename(entity.path) != os.path.basename(old):
+                    entity.name = os.path.basename(entity.path)
+        for snapshot in self._scene_snapshots:
+            for old, new in changes:
+                placements = snapshot.tree.get("placements", {})
+                ancestors = [p for p in placements if old == p or old.startswith(p.rstrip(os.sep) + os.sep)]
+                parent = max(ancestors, key=len) if ancestors else None
+                logical_old = relocate_path(old, parent, placements[parent]) if parent else old
+                logical_new = (os.path.join(os.path.dirname(logical_old), os.path.basename(new))
+                               if logical_old != old else new)
+                def logical_mapped(path):
+                    return relocate_path(relocate_path(path, logical_old, logical_new), old, new)
+                for key in ("roots", "directories"):
+                    snapshot.tree[key] = [relocate_path(p, old, new) for p in snapshot.tree.get(key, [])]
+                snapshot.tree["expanded"] = [logical_mapped(p) for p in snapshot.tree.get("expanded", [])]
+                snapshot.tree["placements"] = {relocate_path(p, old, new): logical_mapped(group)
+                                               for p, group in placements.items()}
+        for record in self._trash_records:
+            record.sources[:] = [mapped(path) for path in record.sources]
+            record.moves[:] = [(mapped(original), trash) for original, trash in record.moves]
+        self.settings.recent_files = list(dict.fromkeys(mapped(p) for p in self.settings.recent_files))
+        self.settings.last_dir = mapped(self.settings.last_dir)
+        self._load_queue = [mapped(p) for p in self._load_queue]
+        self._pending_display = {mapped(p): state for p, state in self._pending_display.items()}
+        self._deferred_imports = [mapped(p) for p in self._deferred_imports]
+        self._restoring_project = True
+        try:
+            for old, new in changes:
+                self.scene_panel.remap_paths(old, new)
+        finally:
+            self._restoring_project = False
+        self._rebuild_recent_menu()
+        save_settings(self.settings)
+        self._show_entity(self.scene_panel.current_entity())
+        self._refresh_scene()
+
+    def _on_source_changes(self, changes, imports, label):
+        self._apply_source_changes(changes)
+        for path in imports:
+            for old, new in changes:
+                path = relocate_path(path, old, new)
+            self._deferred_imports.append(path)
+        self.log(f"{label}完成（{len(changes)} 项）；如需保留工程，请重新保存。")
+        self._flash_status(label + "完成", 4000)
+
+    def _on_source_failure(self, error):
+        remaining = getattr(error, "remaining_moves", [])
+        if remaining:
+            self._apply_source_changes(remaining)
+            self._deferred_imports.extend(new for _old, new in remaining)
+        message = str(error)
+        if isinstance(error, FileExistsError):
+            message = "目标存在同名文件或文件夹，未覆盖原文件：" + message
+        self.log("路径操作失败：" + message)
+        self._flash_status("操作失败，请查看日志：" + message, 8000)
+
+    def _on_source_finished(self):
+        thread = self._source_operation
+        self._source_operation = None
+        if thread is not None:
+            thread.deleteLater()
+        self.status_task.clear()
+        self.centralWidget().setEnabled(True)
+        imports, self._deferred_imports = self._deferred_imports, []
+        if not self._closing:
+            if imports:
+                self.open_paths(imports)
+            self._schedule_frame_loads()
 
     def _reload_entity(self, entity: CloudEntity):
         """按源文件重新读取并原地替换数据（后台线程，保留显示状态）。"""
+        if self._source_operation is not None:
+            self._flash_status("文件移动中，请稍后再重新加载。", 6000)
+            return
         if not entity.path or not os.path.exists(entity.path):
             self.log("无法重新加载：该点云没有源文件")
             self._flash_status("无法重新加载：没有源文件")
@@ -1512,6 +2067,9 @@ class MainWindow(QMainWindow):
         return entity
 
     def _run_filter(self, title: str, worker, command: Command | None = None):
+        if self._source_operation is not None:
+            self._flash_status("文件移动中，请稍后再处理。", 6000)
+            return
         if self._filter_thread is not None:
             self.log("已有处理任务在进行，请稍候")
             return
@@ -1614,6 +2172,9 @@ class MainWindow(QMainWindow):
         self.btn_redo.setToolTip("重做 (Ctrl+Shift+Z)" if can_redo else "重做 (Ctrl+Shift+Z) — 暂无可重做操作")
 
     def _undo(self):
+        if self._source_operation is not None:
+            self._flash_status("正在操作原文件，请完成后再撤销。", 5000)
+            return
         if self._clip_commit_timer.isActive():
             self._clip_commit_timer.stop()
             self._commit_clip_history()
@@ -1627,6 +2188,9 @@ class MainWindow(QMainWindow):
         self._update_history_buttons()
 
     def _redo(self):
+        if self._source_operation is not None:
+            self._flash_status("正在操作原文件，请完成后再重做。", 5000)
+            return
         label = self.history.redo()
         if label is None:
             self.log("没有可重做的操作")
@@ -2391,10 +2955,50 @@ class MainWindow(QMainWindow):
         if folder:
             self.open_paths([folder])
 
-    def _save_project_dialog(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存工程", "", "PointLab 工程 (*.pls)")
-        if path:
-            self.save_project(path)
+    def _project_operation_blocked(self):
+        blocked = bool(self._source_operation is not None or self._threads or self._scan_threads
+                       or self._filter_thread is not None or self._eps_thread is not None)
+        if blocked:
+            self._flash_status("正在加载、处理或操作原文件，请完成后再操作工程。", 6000)
+        return blocked
+
+    def _clear_project_scene(self):
+        if self._project_operation_blocked():
+            return False
+        self._restoring_project = True
+        try:
+            self._clip_commit_timer.stop()
+            self._set_tool(None)
+            self.viewport.clear_measurement()
+            self.viewport.clear_selection()
+            self._selection = []
+            self.entities.clear()
+            for mesh in list(self.meshes):
+                self._remove_mesh(mesh)
+            self._auto_mesh = None
+            self._load_queue.clear()
+            self._pending_display.clear()
+            self._deferred_imports.clear()
+            self._pending_regroups.clear()
+            self._explicit_loads.clear()
+            self._frame_cache.clear()
+            self._known_source_entities = WeakSet()
+            self._scene_snapshots = WeakSet()
+            self._trash_records = WeakSet()
+            self._result_sources = WeakKeyDictionary()
+            self.history.clear()
+            self.scene_panel.set_entities([])
+            self.scene_panel.restore_tree_state({"roots": [], "directories": [], "expanded": [], "placements": {}})
+            self._apply_clip_state({"enabled": False})
+            self._camera_initialized = False
+            self._show_entity(None)
+        finally:
+            self._restoring_project = False
+        self._refresh_scene()
+        if self.frame_browser.secondary is not None:
+            self.frame_browser.secondary.set_entities([])
+        self._update_history_buttons()
+        return True
 
     @staticmethod
     def _write_asset(entity: CloudEntity, path: str) -> None:
@@ -2404,6 +3008,34 @@ class MainWindow(QMainWindow):
             arrays["field__" + name] = np.asarray(field.data)
             arrays["kind__" + name] = np.array(str(field.kind))
         np.savez_compressed(path, **arrays)
+
+    @staticmethod
+    def _store_project_asset(directory, kind, writer):
+        """Publish immutable, content-addressed assets before updating the manifest."""
+        os.makedirs(directory, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".saving-", suffix=".npz", dir=directory)
+        os.close(descriptor)
+        def digest(path):
+            result = hashlib.sha256()
+            with open(path, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    result.update(chunk)
+            return result.hexdigest()
+        try:
+            writer(temporary)
+            checksum = digest(temporary)
+            name = f"{kind}-{checksum}.npz"
+            target = os.path.join(directory, name)
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                if digest(target) != checksum:
+                    name = f"{kind}-{checksum}-{uuid4().hex}.npz"
+                    os.link(temporary, os.path.join(directory, name))
+            return f"{os.path.basename(directory)}/{name}"
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     @staticmethod
     def _read_asset(path: str):
@@ -2425,6 +3057,9 @@ class MainWindow(QMainWindow):
         v2 格式：源文件写相对路径，派生点云写入 `<工程名>.assets/*.npz`，
         同时保存相机、裁剪范围与每片点云的显示状态。
         """
+        if self._source_operation is not None:
+            self._flash_status("文件移动中，工程尚未保存，请稍后再试。", 6000)
+            return False
         if not path.lower().endswith(".pls"):
             path += ".pls"
         base = os.path.dirname(os.path.abspath(path))
@@ -2456,25 +3091,38 @@ class MainWindow(QMainWindow):
                     continue
                 if e.xyz is None or not len(e.xyz):
                     continue
-                os.makedirs(asset_dir, exist_ok=True)
-                stem = "".join(ch for ch in e.name if ch.isalnum() or ch in "-_")[:40] or "cloud"
-                asset = f"{index:02d}_{stem}.npz"
-                self._write_asset(e, os.path.join(asset_dir, asset))
-                entry["asset"] = f"{os.path.basename(asset_dir)}/{asset}"
+                entry["asset"] = self._store_project_asset(asset_dir, "cloud",
+                                                          lambda target, cloud=e: self._write_asset(cloud, target))
                 derived.append(entry)
 
             for index, mesh in enumerate(self.meshes):
-                os.makedirs(asset_dir, exist_ok=True)
-                asset = f"mesh_{index:02d}.npz"
-                np.savez_compressed(os.path.join(asset_dir, asset),
-                                    vertices=mesh.vertices, triangles=mesh.triangles)
-                meshes.append({"name": mesh.name, "asset": f"{os.path.basename(asset_dir)}/{asset}",
+                asset = self._store_project_asset(asset_dir, "mesh", lambda target, m=mesh:
+                    np.savez_compressed(target, vertices=m.vertices, triangles=m.triangles))
+                meshes.append({"name": mesh.name, "asset": asset,
                                "visible": mesh.visible, "color": list(mesh.color),
                                "opacity": mesh.opacity, "info": mesh.info})
 
             clip = self._clip_state()
+            tree_state = self.scene_panel.tree_state()
+            portable_tree = {}
+            for key in ("roots", "directories", "expanded"):
+                portable_tree[key] = []
+                for folder in tree_state.get(key, []):
+                    try:
+                        folder = os.path.relpath(folder, base)
+                    except ValueError:
+                        pass
+                    portable_tree[key].append(folder.replace(os.sep, "/"))
+            def portable_path(source):
+                try:
+                    return os.path.relpath(source, base).replace(os.sep, "/")
+                except ValueError:
+                    return source
+            portable_tree["placements"] = {portable_path(source): portable_path(group)
+                                           for source, group in tree_state.get("placements", {}).items()}
             data = {
                 "version": 2,
+                "scene_tree": portable_tree,
                 "theme": self.theme,
                 "camera": self.viewport.camera_state(),
                 "clip": {
@@ -2499,15 +3147,11 @@ class MainWindow(QMainWindow):
             os.replace(temporary, path)
             self.log(f"工程已保存: {path}（{len(files)} 片源点云，{len(derived)} 片派生点云，{len(meshes)} 个网格）")
             self._flash_status("工程已保存")
+            self._mark_project_saved(path)
             return True
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "保存失败", str(exc))
             return False
-
-    def _open_project_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开工程", "", "PointLab 工程 (*.pls)")
-        if path:
-            self.open_project(path)
 
     def _add_mesh(self, mesh):
         if mesh not in self.meshes:
@@ -2600,6 +3244,9 @@ class MainWindow(QMainWindow):
 
     def open_project(self, path: str) -> bool:
         """从 .pls 打开工程（先登记显示状态，再按 Auto-Ingest 加载）。"""
+        if self._source_operation is not None:
+            self._flash_status("文件移动中，请稍后再打开工程。", 6000)
+            return False
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -2607,6 +3254,25 @@ class MainWindow(QMainWindow):
             if data.get("theme"):
                 self._set_theme(data["theme"])
             self._restoring_project = True
+            tree_state = data.get("scene_tree")
+            restored_tree = None
+            if isinstance(tree_state, dict):
+                current_tree = self.scene_panel.tree_state()
+                restored_tree = {}
+                for key in ("roots", "directories", "expanded"):
+                    restored_tree[key] = list(dict.fromkeys(
+                        current_tree.get(key, []) + [
+                            os.path.abspath(os.path.join(base, folder))
+                            for folder in tree_state.get(key, []) if isinstance(folder, str)
+                        ]
+                    ))
+                restored_tree["placements"] = dict(current_tree.get("placements", {}))
+                restored_tree["placements"].update({
+                    os.path.abspath(os.path.join(base, source)): os.path.abspath(os.path.join(base, group))
+                    for source, group in tree_state.get("placements", {}).items()
+                    if isinstance(source, str) and isinstance(group, str)
+                })
+                self.scene_panel.restore_tree_state(restored_tree)
             initial_count = len(self.entities)
             restored_order = {}
 
@@ -2695,6 +3361,8 @@ class MainWindow(QMainWindow):
                 current = self.entities[min(initial_count, len(self.entities) - 1)]
             if current is not None:
                 self.scene_panel.select_entity(current)
+            if restored_tree is not None:
+                self.scene_panel.restore_tree_state(restored_tree)
             self._restoring_project = False
             self.frame_browser.direction.setCurrentIndex(0 if browser.get("direction", 1) == 1 else 1)
             self.frame_browser.linked.setChecked(browser.get("linked", True))
@@ -2715,6 +3383,7 @@ class MainWindow(QMainWindow):
                 self.log(f"有 {derived_failed} 个派生数据未能恢复")
                 self._flash_status("部分工程数据未能恢复，请查看日志", 6000)
                 return False
+            self._mark_project_saved(path)
             return True
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "打开失败", str(exc))
@@ -2732,6 +3401,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """关闭前停止渲染循环并回收后台线程，避免 wgpu 回调/线程销毁崩溃。"""
+        if not self._closing and not self._confirm_unsaved_project():
+            event.ignore()
+            return
         self._closing = True
         try:
             self.settings.window_geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
@@ -2744,6 +3416,8 @@ class MainWindow(QMainWindow):
             threads.append(self._filter_thread)
         if self._eps_thread is not None:
             threads.append(self._eps_thread)
+        if self._source_operation is not None:
+            threads.append(self._source_operation)
         for thread in threads:
             thread.requestInterruption()
         if any(thread.isRunning() for thread in threads):
